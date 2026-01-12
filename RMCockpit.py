@@ -1,139 +1,123 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
 
 # ==========================================
-# 1. LOAD DATA
+# 1. APP CONFIGURATION
 # ==========================================
-# Replace these filenames with your actual file paths
-po_history_file = 'POHistory.csv'
-planning_book_file = 'RawPlanningBook.csv'
-
-# Load PO History (handling potential encoding/separator issues common in SAP exports)
-df_po = pd.read_csv(po_history_file, low_memory=False)
-
-# Load Planning Book
-df_plan = pd.read_csv(planning_book_file, low_memory=False)
+st.set_page_config(page_title="Supply Chain Cockpit", layout="wide")
+st.title("📊 Supply Chain Cockpit Generator")
+st.markdown("Upload your **PO History** and **Planning Book** to generate the safety stock analysis.")
 
 # ==========================================
-# 2. PROCESS PO HISTORY (LEAD TIME ANALYSIS)
+# 2. FILE UPLOADERS
 # ==========================================
-print("Processing Lead Times...")
+col1, col2 = st.columns(2)
 
-# Clean up Lead Time column (force numeric, remove empty/errors)
-df_po['real leadtime'] = pd.to_numeric(df_po['real leadtime'], errors='coerce')
-df_po = df_po.dropna(subset=['real leadtime'])
+with col1:
+    po_file = st.file_uploader("Upload POHistory.csv", type=['csv'])
 
-# Group by Material and Plant to calculate Lead Time stats
-# We calculate: Average Lead Time (Avg_LT) and Standard Deviation (Std_LT)
-lt_stats = df_po.groupby(['Material', 'Plnt'])['real leadtime'].agg(
-    Avg_LT='mean',
-    Std_LT='std'
-).reset_index()
+with col2:
+    plan_file = st.file_uploader("Upload RawPlanningBook.csv", type=['csv'])
 
-# Rename columns to match join keys later
-lt_stats.rename(columns={'Plnt': 'Plant', 'Material': 'Material ID'}, inplace=True)
+# Only run the logic if both files are uploaded
+if po_file is not None and plan_file is not None:
+    
+    # ==========================================
+    # 3. LOAD DATA
+    # ==========================================
+    try:
+        df_po = pd.read_csv(po_file, low_memory=False)
+        df_plan = pd.read_csv(plan_file, low_memory=False)
+        
+        st.success("Files loaded successfully! Processing data...")
 
-# ==========================================
-# 3. PROCESS PLANNING BOOK (DEMAND & STOCK)
-# ==========================================
-print("Processing Demand & Stock...")
+        # ==========================================
+        # 4. PROCESS PO HISTORY (LEAD TIME)
+        # ==========================================
+        # Clean up Lead Time column
+        df_po['real leadtime'] = pd.to_numeric(df_po['real leadtime'], errors='coerce')
+        df_po = df_po.dropna(subset=['real leadtime'])
 
-# Ensure Report_Date is datetime to find the latest snapshot
-df_plan['Report_Date'] = pd.to_datetime(df_plan['Report_Date'], errors='coerce')
+        # Calculate Stats
+        lt_stats = df_po.groupby(['Material', 'Plnt'])['real leadtime'].agg(
+            Avg_LT='mean',
+            Std_LT='std'
+        ).reset_index()
 
-# Sort by date and take the latest entry for each Plant/Material combination
-# This gives us the current Stock and the pre-calculated 12-month stats
-current_snapshot = df_plan.sort_values('Report_Date').groupby(['Plant', 'Material ID']).tail(1).copy()
+        lt_stats.rename(columns={'Plnt': 'Plant', 'Material': 'Material ID'}, inplace=True)
 
-# Select relevant columns for the cockpit
-# Note: 'Avg Last 12 Mths Factory Usage Qty' = Average Sale/Demand
-# Note: 'Std Dev Last 12 Mths Factory Usage Qty' = Demand Standard Deviation
-cols_to_keep = [
-    'Plant', 
-    'Material ID', 
-    'Material Desc', 
-    'Unrestricted Stock Qty', 
-    'Avg Last 12 Mths Factory Usage Qty', 
-    'Std Dev Last 12 Mths Factory Usage Qty',
-    'Report_Date'
-]
+        # ==========================================
+        # 5. PROCESS PLANNING BOOK (DEMAND)
+        # ==========================================
+        # Sort by date and take the latest entry
+        df_plan['Report_Date'] = pd.to_datetime(df_plan['Report_Date'], errors='coerce')
+        current_snapshot = df_plan.sort_values('Report_Date').groupby(['Plant', 'Material ID']).tail(1).copy()
 
-df_cockpit = current_snapshot[cols_to_keep].copy()
+        # Select relevant columns
+        cols_to_keep = [
+            'Plant', 'Material ID', 'Material Desc', 'Unrestricted Stock Qty', 
+            'Avg Last 12 Mths Factory Usage Qty', 
+            'Std Dev Last 12 Mths Factory Usage Qty'
+        ]
+        
+        # Check if columns exist before selecting
+        available_cols = [c for c in cols_to_keep if c in current_snapshot.columns]
+        df_cockpit = current_snapshot[available_cols].copy()
 
-# Rename columns for clarity in formulas
-df_cockpit.rename(columns={
-    'Unrestricted Stock Qty': 'Current_Stock',
-    'Avg Last 12 Mths Factory Usage Qty': 'Avg_Demand',
-    'Std Dev Last 12 Mths Factory Usage Qty': 'Std_Demand'
-}, inplace=True)
+        df_cockpit.rename(columns={
+            'Unrestricted Stock Qty': 'Current_Stock',
+            'Avg Last 12 Mths Factory Usage Qty': 'Avg_Demand',
+            'Std Dev Last 12 Mths Factory Usage Qty': 'Std_Demand'
+        }, inplace=True)
 
-# ==========================================
-# 4. MERGE DATA SOURCES
-# ==========================================
-print("Merging Datasets...")
+        # ==========================================
+        # 6. MERGE & CALCULATE
+        # ==========================================
+        final_df = pd.merge(df_cockpit, lt_stats, on=['Plant', 'Material ID'], how='left')
 
-# Merge Demand/Stock data with Lead Time data
-final_df = pd.merge(df_cockpit, lt_stats, on=['Plant', 'Material ID'], how='left')
+        # Fill NaNs
+        final_df[['Avg_LT', 'Std_LT', 'Avg_Demand', 'Std_Demand']] = final_df[['Avg_LT', 'Std_LT', 'Avg_Demand', 'Std_Demand']].fillna(0)
 
-# Fill NaN values for Lead Times (if no PO history exists) with 0 or a default
-final_df['Avg_LT'] = final_df['Avg_LT'].fillna(0)
-final_df['Std_LT'] = final_df['Std_LT'].fillna(0)
-final_df['Avg_Demand'] = final_df['Avg_Demand'].fillna(0)
-final_df['Std_Demand'] = final_df['Std_Demand'].fillna(0)
+        # Safety Stock Formula (Z=1.65 for 95%)
+        Z_SCORE = 1.65
+        term1 = final_df['Avg_LT'] * (final_df['Std_Demand'] ** 2)
+        term2 = (final_df['Avg_Demand'] ** 2) * (final_df['Std_LT'] ** 2)
+        final_df['Calculated_Safety_Stock'] = Z_SCORE * np.sqrt(term1 + term2)
 
-# ==========================================
-# 5. CALCULATE SAFETY STOCK
-# ==========================================
-# Formula from your snippet:
-# Z * sqrt( (Avg LT * (Demand Std Dev)^2) + (Avg Sale * Lead Time Std Dev)^2 )
-# Note: The snippet implies the second term is squared inside or outside. 
-# Standard Inventory theory usually follows: Z * sqrt( (Avg_LT * Std_Demand^2) + (Avg_Demand^2 * Std_LT^2) )
+        # Months of Coverage
+        final_df['Months_Coverage'] = final_df.apply(
+            lambda x: x['Current_Stock'] / x['Avg_Demand'] if x['Avg_Demand'] > 0 else 0, axis=1
+        )
 
-Z_SCORE = 1.65  # 95% Service Level (Adjustable)
+        # ==========================================
+        # 7. DISPLAY & DOWNLOAD
+        # ==========================================
+        # Format for display
+        output_columns = [
+            'Plant', 'Material ID', 'Material Desc', 'Current_Stock', 
+            'Avg_Demand', 'Std_Demand', 'Avg_LT', 'Std_LT', 
+            'Calculated_Safety_Stock', 'Months_Coverage'
+        ]
+        
+        # Ensure only existing columns are selected
+        final_output_cols = [c for c in output_columns if c in final_df.columns]
+        cockpit_output = final_df[final_output_cols].round(2).sort_values('Months_Coverage')
 
-print(f"Calculating Safety Stock (Z={Z_SCORE})...")
+        st.subheader("Results")
+        st.dataframe(cockpit_output)
 
-# Calculate components for readability
-term1 = final_df['Avg_LT'] * (final_df['Std_Demand'] ** 2)
-term2 = (final_df['Avg_Demand'] ** 2) * (final_df['Std_LT'] ** 2)
+        # CSV Download Button
+        csv = cockpit_output.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Cockpit Report as CSV",
+            data=csv,
+            file_name='Generated_Cockpit_Report.csv',
+            mime='text/csv',
+        )
 
-# Apply Formula
-final_df['Calculated_Safety_Stock'] = Z_SCORE * np.sqrt(term1 + term2)
+    except Exception as e:
+        st.error(f"An error occurred while processing the files: {e}")
 
-# ==========================================
-# 6. SUPPLY SITUATION SUMMARY
-# ==========================================
-# Calculate Months of Coverage
-# Avoid division by zero
-final_df['Months_Coverage'] = final_df.apply(
-    lambda x: x['Current_Stock'] / x['Avg_Demand'] if x['Avg_Demand'] > 0 else 0, axis=1
-)
-
-# Organize columns for final output
-output_columns = [
-    'Plant', 
-    'Material ID', 
-    'Material Desc', 
-    'Current_Stock', 
-    'Avg_Demand', 
-    'Std_Demand', 
-    'Avg_LT', 
-    'Std_LT', 
-    'Calculated_Safety_Stock',
-    'Months_Coverage'
-]
-
-# Formatting the output
-cockpit_output = final_df[output_columns].round(2)
-
-# Sort by lowest coverage first to highlight risks
-cockpit_output = cockpit_output.sort_values('Months_Coverage', ascending=True)
-
-# ==========================================
-# 7. EXPORT
-# ==========================================
-output_filename = 'Generated_Cockpit_Report.csv'
-cockpit_output.to_csv(output_filename, index=False)
-
-print(f"Success! Cockpit generated: {output_filename}")
-print(cockpit_output.head())
+else:
+    st.info("Please upload both CSV files to proceed.")
