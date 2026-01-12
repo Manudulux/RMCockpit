@@ -132,3 +132,16 @@ if po_file is not None and plan_file is not None:
 
         # CSV Download Button
         csv = cockpit_output.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            label="Download Cockpit Report as CSV",
+            data=csv,
+            file_name='Generated_Cockpit_Report.csv',
+            mime='text/csv',
+        )
+
+    except Exception as e:
+        st.error(f"An error occurred: {e}")
+        st.write("Hint: Check if your CSV files have the correct column names.")
+
+else:
+    st.info("Please upload both CSV files to proceed.")
