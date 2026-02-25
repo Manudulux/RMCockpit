@@ -1,6 +1,6 @@
 # streamlit_app.py
-# Streamlit app: scan the script folder (same dir) and/or drag&drop Excel files,
-# load into SQLite with progress bars, and build Blocked Stock Qty reporting.
+# Streamlit app: scan the script folder and/or drag&drop Excel files,
+# load into SQLite (with dedup + progress bars), and report Blocked Stock Qty.
 # Author: Emmanuel + Copilot
 
 import glob
@@ -161,6 +161,16 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
+    # drop rows with no snapshot_date or no material id (often header bleed)
+    if "Material ID" in df.columns:
+        df = df[~(df["snapshot_date"].isna() | df["Material ID"].astype(str).str.strip().eq(""))]
+
+    # drop exact duplicates within the batch
+    df = df.drop_duplicates(
+        subset=["version_tag", "snapshot_date", "Plant ID", "Material ID"],
+        keep="last"
+    )
+
     return df
 
 def read_xlsx_all_sheets(uploaded_file) -> pd.DataFrame:
@@ -210,6 +220,16 @@ def to_sql_with_progress(df: pd.DataFrame, table: str, conn: sqlite3.Connection,
     pb.empty()
     return written
 
+def dedup_delete_existing_version(conn: sqlite3.Connection, version_tag: str) -> int:
+    """De-dup strategy: delete all existing RM rows for this version, then insert the fresh batch."""
+    cur = conn.execute(f'SELECT COUNT(*) FROM {TABLE_RM} WHERE version_tag = ?', (version_tag,))
+    cnt = cur.fetchone()[0] or 0
+    if cnt > 0:
+        st.info(f"🧹 De-dup: removing existing {cnt:,} row(s) for version `{version_tag}` …")
+        conn.execute(f'DELETE FROM {TABLE_RM} WHERE version_tag = ?', (version_tag,))
+        conn.commit()
+    return cnt
+
 def ingest_filelike(file_like: io.BytesIO, version_tag: str) -> List[str]:
     """Ingest a single file-like object (BytesIO) and return messages."""
     msgs = []
@@ -224,6 +244,10 @@ def ingest_filelike(file_like: io.BytesIO, version_tag: str) -> List[str]:
 
         if kind == "RM":
             df_norm = normalize_rm_dataframe(df_all, fname, version_tag)
+
+            # ---- De-dup per version_tag
+            dedup_delete_existing_version(conn, version_tag)
+
             rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
             conn.execute(
                 f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
@@ -388,13 +412,39 @@ def render_time_series(df: pd.DataFrame):
           .sort_values("snapshot_date")
     )
 
-    # Date range slider
+    unique_dates = ts["snapshot_date"].dropna().unique()
+    if len(unique_dates) <= 1:
+        # Guard: if there is only one (or zero) snapshot, don't use a range slider
+        if len(unique_dates) == 0:
+            st.info("No valid snapshot dates found after filters.")
+            return
+        st.caption(f"Single snapshot date: {pd.to_datetime(unique_dates[0]).date()}")
+        import plotly.express as px
+        fig = px.line(
+            ts,
+            x="snapshot_date",
+            y="Blocked Stock Qty",
+            markers=True,
+            title="Blocked Stock Qty Evolution (single snapshot)",
+            labels={"snapshot_date": "Snapshot Date", "Blocked Stock Qty": "Blocked Stock Qty"},
+        )
+        fig.update_layout(hovermode="x unified", height=420)
+        st.plotly_chart(fig, use_container_width=True)
+        with st.expander("Show aggregated data"):
+            st.dataframe(ts, use_container_width=True)
+        return
+
+    # Date range slider (for >= 2 distinct dates)
     min_d, max_d = ts["snapshot_date"].min(), ts["snapshot_date"].max()
+    # Ensure python datetime objects
+    min_dt = pd.to_datetime(min_d).to_pydatetime()
+    max_dt = pd.to_datetime(max_d).to_pydatetime()
+
     dr = st.slider(
         "Snapshot date range",
-        min_value=min_d.to_pydatetime(),
-        max_value=max_d.to_pydatetime(),
-        value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
+        min_value=min_dt,
+        max_value=max_dt,
+        value=(min_dt, max_dt),
         format="YYYY-MM-DD"
     )
     ts = ts[(ts["snapshot_date"] >= pd.to_datetime(dr[0])) & (ts["snapshot_date"] <= pd.to_datetime(dr[1]))]
@@ -452,7 +502,7 @@ def render_cut_by_dimensions(df: pd.DataFrame):
 # UI
 # -------------------------------------------
 st.title("📦 Blocked Stock Reporting (RM) + Ingestion")
-st.caption("Scan this folder or upload files, load into SQLite (with progress), and explore Blocked Stock Qty over time.")
+st.caption("Scan this folder or upload files, load into SQLite (with de‑dup + progress), and explore Blocked Stock Qty over time.")
 
 with st.sidebar:
     st.markdown("### 📥 Ingest data")
@@ -532,10 +582,10 @@ with st.expander("Show filtered rows"):
 st.markdown("---")
 st.markdown(
     "ℹ️ **Notes**\n"
+    "- **De-duplication:** reloading the same version replaces prior rows for that `version_tag`.\n"
     "- Folder scan shows **exactly which `.xlsx` files** are detected in the script folder.\n"
-    "- For folder scan, the **version tag** is the file's **modified date (UTC)**; uploads use the textbox value.\n"
-    "- The report uses **RM Extract** (columns: Plant, Plant ID, Material ID, Material Desc, Material Group Desc, Blocked Stock Qty, Month/Year or Report_Date)."
+    "- For folder scan, the **version tag** is each file's **modified date (UTC)**; uploads use the textbox value.\n"
+    "- The report uses **RM Extract** columns: Plant, Plant ID, Material ID, Material Desc, Material Group Desc, Blocked Stock Qty, and Month/Year or Report_Date."
 )
-
 
 
