@@ -1,6 +1,6 @@
 # streamlit_app.py
-# Streamlit app: auto-load Excel from the script folder + drag&drop, store to SQLite, and report Blocked Stock Qty
-# With progress bars, SQLite tuning & indexes, and hardened Excel ingestion.
+# Streamlit app: scan the script folder (same dir) and/or drag&drop Excel files,
+# load into SQLite with progress bars, and build Blocked Stock Qty reporting.
 # Author: Emmanuel + Copilot
 
 import glob
@@ -15,19 +15,19 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# ---------------------------
+# -------------------------------------------
 # Page config
-# ---------------------------
+# -------------------------------------------
 st.set_page_config(page_title="Blocked Stock Report", page_icon="📦", layout="wide")
 
-# ---------------------------
-# Settings
-# ---------------------------
-SCRIPT_DIR = Path(__file__).parent.resolve()  # default scan folder = where this script lives
+# -------------------------------------------
+# Paths / Settings
+# -------------------------------------------
+SCRIPT_DIR = Path(__file__).parent.resolve()                 # we scan THIS folder
 DB_PATH = os.environ.get("APP_DB_PATH", str(SCRIPT_DIR / "data.db"))
 
 TABLE_RM = "rm_inventory_raw"       # normalized RM data for reporting
-TABLE_PO = "po_history_raw"         # PO history stored raw (not used in charts)
+TABLE_PO = "po_history_raw"         # raw PO history (stored for completeness)
 TABLE_LOG = "ingestion_log"
 
 REPORT_COLUMNS = [
@@ -35,33 +35,33 @@ REPORT_COLUMNS = [
     "Material Desc", "Material Group Desc", "Blocked Stock Qty"
 ]
 
-# ---------------------------
-# Extra hardening: preflight checks
-# ---------------------------
+# -------------------------------------------
+# Hardening: require openpyxl for .xlsx
+# -------------------------------------------
 try:
     import openpyxl  # noqa: F401
 except Exception as e:
     st.error(
         "The **openpyxl** package is required to read `.xlsx` files but is not available.\n\n"
-        "Please ensure `openpyxl` is listed in **requirements.txt**, redeploy the app, and try again.\n\n"
+        "Please ensure `openpyxl` is in **requirements.txt**, redeploy, and try again.\n\n"
         f"Details: `{e}`"
     )
     st.stop()
 
-# ---------------------------
-# DB helpers (sqlite3)
-# ---------------------------
+# -------------------------------------------
+# SQLite helpers
+# -------------------------------------------
 def get_conn() -> sqlite3.Connection:
-    # Create/tune SQLite for decent read performance
     conn = sqlite3.connect(
         DB_PATH,
         detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         check_same_thread=False,
     )
+    # Pragmas to improve read/write performance
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
-    conn.execute("PRAGMA cache_size=-256000;")  # ~256MB page cache
+    conn.execute("PRAGMA cache_size=-256000;")  # ~256MB cache (adjust if needed)
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
 
@@ -69,17 +69,17 @@ def ensure_tables(conn: sqlite3.Connection):
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_LOG} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            table_name TEXT NOT NULL,
-            source_file TEXT NOT NULL,
-            version_tag TEXT NOT NULL,
+            table_name      TEXT NOT NULL,
+            source_file     TEXT NOT NULL,
+            version_tag     TEXT NOT NULL,
             uploaded_at_utc TEXT NOT NULL,
-            rows_loaded INTEGER NOT NULL
+            rows_loaded     INTEGER NOT NULL
         );
     """)
     conn.commit()
 
 def ensure_indexes(conn: sqlite3.Connection):
-    # Indexes to speed filtering and date slicing
+    # Indexes to speed up WHERE filters and date slicing
     idx_sql = [
         f'CREATE INDEX IF NOT EXISTS idx_rm_snapshot      ON {TABLE_RM}(snapshot_date);',
         f'CREATE INDEX IF NOT EXISTS idx_rm_plant         ON {TABLE_RM}("Plant");',
@@ -96,20 +96,20 @@ def ensure_indexes(conn: sqlite3.Connection):
             pass
     conn.commit()
 
-# ---------------------------
+# -------------------------------------------
 # Utilities
-# ---------------------------
+# -------------------------------------------
 def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
-    """Convert Excel serials or strings → pandas datetime.date (normalized)."""
+    """Convert Excel serial or string dates → pandas datetime.date (normalized)."""
     if series is None:
         return pd.to_datetime(pd.Series([], dtype="float64"), errors="coerce")
 
     s = series.copy()
-    # Try numeric → Excel serial
+    # numeric → Excel serial
     s_num = pd.to_numeric(s, errors="coerce")
     dt = pd.to_datetime(s_num, unit="D", origin="1899-12-30", errors="coerce")
 
-    # Fill NaT via normal parsing
+    # fill NaT with normal parse
     need = dt.isna()
     if need.any():
         dt2 = pd.to_datetime(s.astype(str), errors="coerce", dayfirst=False, infer_datetime_format=True)
@@ -118,6 +118,7 @@ def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(dt.dt.date, errors="coerce")
 
 def detect_file_kind(file_name: str, df: pd.DataFrame) -> str:
+    """Simple heuristic: RM Extract contains these columns; else treat as PO."""
     cols = set(df.columns)
     if {"Blocked Stock Qty", "Material ID", "Plant", "Plant ID"}.issubset(cols):
         return "RM"
@@ -132,31 +133,30 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
 
     missing = [c for c in REPORT_COLUMNS if c not in df.columns]
     if missing:
-        sample_cols = ", ".join(list(df.columns)[:15])
+        sample = ", ".join(df.columns[:15])
         raise ValueError(
-            "RM Extract is missing required columns: "
-            f"{missing}. First columns seen: {sample_cols}"
+            f"RM Extract missing required columns: {missing}. "
+            f"First columns seen: {sample}"
         )
 
-    # Keep only needed columns to reduce memory
-    keep = [c for c in REPORT_COLUMNS if c in df.columns]
-    df = df[keep].copy()
+    # keep only the columns we actually need
+    df = df[[c for c in REPORT_COLUMNS if c in df.columns]].copy()
 
-    # Compute snapshot_date (prefer Report_Date, else Month/Year)
+    # snapshot date (prefer Report_Date else Month/Year)
     snap = excel_serial_to_datetime(df.get("Report_Date"))
     if snap.isna().all():
         snap = excel_serial_to_datetime(df.get("Month/Year"))
     df["snapshot_date"] = snap
 
-    # Coerce numeric for Blocked Stock Qty
+    # numeric conversion
     df["Blocked Stock Qty"] = pd.to_numeric(df["Blocked Stock Qty"], errors="coerce").fillna(0.0)
 
-    # Meta
+    # meta
     df["source_file"] = src_name
     df["version_tag"] = version_tag
     df["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
 
-    # Tidy filter columns (trim → string)
+    # tidy filter columns
     for c in ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -164,12 +164,12 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
     return df
 
 def read_xlsx_all_sheets(uploaded_file) -> pd.DataFrame:
-    """Read all sheets from .xlsx and concat; raise descriptive errors."""
+    """Read and concat all non-empty sheets; raise clear errors if reading fails."""
     try:
         xls = pd.ExcelFile(uploaded_file)  # engine auto-detected (needs openpyxl)
     except Exception as e:
         raise RuntimeError(
-            "Failed to open Excel file. Make sure it is a valid `.xlsx` workbook. "
+            "Failed to open Excel file. Ensure it is a valid `.xlsx` workbook. "
             f"Reader error: {e}"
         ) from e
 
@@ -182,16 +182,16 @@ def read_xlsx_all_sheets(uploaded_file) -> pd.DataFrame:
                 frames.append(tmp)
     except Exception as e:
         raise RuntimeError(
-            f"Failed to parse at least one sheet. Sheets: {xls.sheet_names}. Parser error: {e}"
+            f"Failed parsing at least one sheet. Sheets: {xls.sheet_names}. Error: {e}"
         ) from e
 
     if not frames:
-        raise RuntimeError("No non-empty sheets found in the workbook.")
+        raise RuntimeError("No non-empty sheets found in workbook.")
 
     return pd.concat(frames, ignore_index=True)
 
 def to_sql_with_progress(df: pd.DataFrame, table: str, conn: sqlite3.Connection, label: str = "") -> int:
-    """Chunked insert with an in-UI progress bar."""
+    """Chunked insert with a progress bar in the UI."""
     total = len(df)
     if total == 0:
         return 0
@@ -200,7 +200,6 @@ def to_sql_with_progress(df: pd.DataFrame, table: str, conn: sqlite3.Connection,
     pb = st.progress(0, text=f"Writing {label} → {table} …")
     written = 0
 
-    # First chunk uses if_exists='append'; all chunks the same table append
     for start in range(0, total, chunk):
         end = min(start + chunk, total)
         df.iloc[start:end].to_sql(table, conn, if_exists="append", index=False, method="multi")
@@ -211,56 +210,46 @@ def to_sql_with_progress(df: pd.DataFrame, table: str, conn: sqlite3.Connection,
     pb.empty()
     return written
 
-def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
-    """Ingest files provided by st.file_uploader with progress bars."""
+def ingest_filelike(file_like: io.BytesIO, version_tag: str) -> List[str]:
+    """Ingest a single file-like object (BytesIO) and return messages."""
     msgs = []
     conn = get_conn()
     ensure_tables(conn)
 
-    overall = st.progress(0, text="Starting ingestion …")
-    total_files = len(files)
-    done = 0
+    fname = getattr(file_like, "name", "uploaded.xlsx")
+    try:
+        st.write(f"📄 **Processing:** {fname}")
+        df_all = read_xlsx_all_sheets(file_like)
+        kind = detect_file_kind(fname, df_all)
 
-    for f in files:
-        fname = getattr(f, "name", "uploaded.xlsx")
-        try:
-            st.write(f"📄 **Processing:** {fname}")
-            df_all = read_xlsx_all_sheets(f)
-            kind = detect_file_kind(fname, df_all)
+        if kind == "RM":
+            df_norm = normalize_rm_dataframe(df_all, fname, version_tag)
+            rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
+            conn.execute(
+                f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
+                f"VALUES (?, ?, ?, ?, ?)",
+                (TABLE_RM, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
+            )
+            conn.commit()
+            msgs.append(f"✅ {fname}: loaded {rows:,} rows into '{TABLE_RM}' (version '{version_tag}').")
+        else:
+            df_po = df_all.copy()
+            df_po["source_file"] = fname
+            df_po["version_tag"] = version_tag
+            df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+            rows = to_sql_with_progress(df_po, TABLE_PO, conn, label=fname)
+            conn.execute(
+                f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
+                f"VALUES (?, ?, ?, ?, ?)",
+                (TABLE_PO, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
+            )
+            conn.commit()
+            msgs.append(f"✅ {fname}: loaded {rows:,} rows into '{TABLE_PO}' (version '{version_tag}').")
 
-            if kind == "RM":
-                df_norm = normalize_rm_dataframe(df_all, fname, version_tag)
-                rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
-                conn.execute(
-                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
-                    f"VALUES (?, ?, ?, ?, ?)",
-                    (TABLE_RM, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
-                )
-                conn.commit()
-                msgs.append(f"✅ {fname}: loaded {rows:,} rows into '{TABLE_RM}' (version '{version_tag}').")
-            else:
-                df_po = df_all.copy()
-                df_po["source_file"] = fname
-                df_po["version_tag"] = version_tag
-                df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
-                rows = to_sql_with_progress(df_po, TABLE_PO, conn, label=fname)
-                conn.execute(
-                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
-                    f"VALUES (?, ?, ?, ?, ?)",
-                    (TABLE_PO, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
-                )
-                conn.commit()
-                msgs.append(f"✅ {fname}: loaded {rows:,} rows into '{TABLE_PO}' (version '{version_tag}').")
+    except Exception as e:
+        msgs.append(f"❌ {fname}: ingestion failed — {e!s}")
 
-        except Exception as e:
-            msgs.append(f"❌ {fname}: ingestion failed — {e!s}")
-
-        done += 1
-        overall.progress(int(done / total_files * 100), text=f"Ingested {done}/{total_files} files")
-
-    overall.empty()
-
-    # Ensure indexes after ingestion
+    # Ensure indexes (safe to repeat)
     try:
         ensure_indexes(conn)
     except Exception:
@@ -268,49 +257,71 @@ def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
 
     return msgs
 
-def scan_script_folder_and_ingest(version_strategy: str = "mtime") -> List[str]:
-    """
-    Scan the script's own folder for .xlsx and ingest.
-    version_strategy:
-      - 'mtime' → version tag = file modified date (UTC, YYYY-MM-DD)
-      - 'now'   → version tag = current UTC date (YYYY-MM-DD)
-    """
-    xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
-    if not xlsx_paths:
-        return [f"⚠️ No .xlsx files found in script folder: `{SCRIPT_DIR}`"]
-
+def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
+    """Ingest files from st.file_uploader (with overall progress)."""
     msgs_all = []
-    overall = st.progress(0, text=f"Scanning {len(xlsx_paths)} file(s) in {SCRIPT_DIR} …")
-    total = len(xlsx_paths)
+    overall = st.progress(0, text="Starting ingestion …")
+    total = len(files)
 
-    for i, path in enumerate(xlsx_paths, start=1):
-        fname = os.path.basename(path)
-        try:
-            with open(path, "rb") as fh:
-                b = io.BytesIO(fh.read())
-                b.name = fname
-
-            if version_strategy == "mtime":
-                ts = datetime.utcfromtimestamp(os.path.getmtime(path))
-                vtag = ts.strftime("%Y-%m-%d")
-            else:
-                vtag = datetime.utcnow().strftime("%Y-%m-%d")
-
-            msgs = load_uploaded_files([b], version_tag=vtag)
-            msgs_all.extend(msgs)
-        except Exception as e:
-            msgs_all.append(f"❌ {fname}: ingestion failed — {e!s}")
-
-        overall.progress(int(i / total * 100), text=f"Processed {i}/{total} file(s)")
+    for i, f in enumerate(files, start=1):
+        msgs_all.extend(ingest_filelike(f, version_tag))
+        overall.progress(int(i / total * 100), text=f"Ingested {i}/{total} files")
 
     overall.empty()
     return msgs_all
 
+def scan_script_folder_and_ingest() -> List[str]:
+    """
+    Scan THIS folder (where streamlit_app.py lives) for .xlsx files and ingest.
+    Version tag = file modified date (UTC, YYYY-MM-DD).
+    """
+    xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
+
+    # Show EXACT paths we found to avoid any ambiguity
+    with st.expander(f"📂 Files detected in script folder ({SCRIPT_DIR}):", expanded=True):
+        if xlsx_paths:
+            for p in xlsx_paths:
+                ts = datetime.utcfromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")
+                st.write(f"- `{Path(p).name}` (mtime UTC: {ts})")
+        else:
+            st.write("_No `.xlsx` files found here._")
+
+    if not xlsx_paths:
+        return [f"⚠️ No .xlsx files found in script folder: `{SCRIPT_DIR}`"]
+
+    msgs_all = []
+    overall = st.progress(0, text=f"Scanning {len(xlsx_paths)} file(s) …")
+    for i, path in enumerate(xlsx_paths, start=1):
+        fname = os.path.basename(path)
+        try:
+            # Build a BytesIO so we reuse the same ingestion path as uploads
+            with open(path, "rb") as fh:
+                b = io.BytesIO(fh.read())
+                b.name = fname
+
+            # Version tag derived from file modified date (UTC)
+            vtag = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
+
+            msgs_all.extend(ingest_filelike(b, version_tag=vtag))
+        except Exception as e:
+            msgs_all.append(f"❌ {fname}: ingestion failed — {e!s}")
+
+        overall.progress(int(i / len(xlsx_paths) * 100), text=f"Processed {i}/{len(xlsx_paths)} file(s)")
+
+    overall.empty()
+    return msgs_all
+
+# -------------------------------------------
+# Data access for reporting
+# -------------------------------------------
 @st.cache_data(show_spinner=False)
 def get_versions() -> List[str]:
     try:
         conn = get_conn()
-        df = pd.read_sql(f"SELECT DISTINCT version_tag FROM {TABLE_LOG} ORDER BY uploaded_at_utc DESC", conn)
+        df = pd.read_sql(
+            f"SELECT DISTINCT version_tag FROM {TABLE_LOG} ORDER BY uploaded_at_utc DESC",
+            conn
+        )
         return df["version_tag"].tolist()
     except Exception:
         return []
@@ -318,7 +329,6 @@ def get_versions() -> List[str]:
 @st.cache_data(show_spinner=False)
 def load_rm_for_report(versions: Optional[List[str]] = None) -> pd.DataFrame:
     conn = get_conn()
-    # Select only what the UI needs (fewer columns → faster)
     base_sql = f"""
         SELECT
             "Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc",
@@ -339,6 +349,9 @@ def load_rm_for_report(versions: Optional[List[str]] = None) -> pd.DataFrame:
             df[c] = df[c].astype(str).str.strip()
     return df
 
+# -------------------------------------------
+# Filtering & Charts
+# -------------------------------------------
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.markdown("### 🔎 Filters")
 
@@ -386,7 +399,6 @@ def render_time_series(df: pd.DataFrame):
     )
     ts = ts[(ts["snapshot_date"] >= pd.to_datetime(dr[0])) & (ts["snapshot_date"] <= pd.to_datetime(dr[1]))]
 
-    # Plotly line chart
     import plotly.express as px
     fig = px.line(
         ts,
@@ -436,19 +448,18 @@ def render_cut_by_dimensions(df: pd.DataFrame):
     with st.expander("Show grouped data"):
         st.dataframe(view, use_container_width=True)
 
-# ---------------------------
+# -------------------------------------------
 # UI
-# ---------------------------
+# -------------------------------------------
 st.title("📦 Blocked Stock Reporting (RM) + Ingestion")
-st.caption("Upload Excel files or scan the script folder, store into SQLite (with progress), and explore Blocked Stock Qty over time.")
+st.caption("Scan this folder or upload files, load into SQLite (with progress), and explore Blocked Stock Qty over time.")
 
-# Sidebar: ingestion
 with st.sidebar:
     st.markdown("### 📥 Ingest data")
     version_tag = st.text_input(
-        "Version tag (e.g., 2026-02)",
+        "Version tag for uploads (e.g., 2026-02)",
         value=datetime.utcnow().strftime("%Y-%m-%d"),
-        help="Tag applied to uploaded files. Folder scan can auto-use file modified date."
+        help="Used for files uploaded via drag & drop. Folder scan uses each file's modified date."
     )
 
     uploads = st.file_uploader(
@@ -458,33 +469,30 @@ with st.sidebar:
         help="Upload 'RM Extract - Data by Month.xlsx' (and optionally 'PO_history.xlsx')."
     )
 
-    col_a, col_b = st.columns(2)
-    with col_a:
+    col1, col2 = st.columns(2)
+    with col1:
         if st.button("Load uploaded files", type="primary", use_container_width=True, disabled=(not uploads)):
-            try:
-                msgs = load_uploaded_files(uploads, version_tag=version_tag)
-                for m in msgs:
-                    st.toast(m, icon="✅" if m.startswith("✅") else "⚠️" if m.startswith("⚠️") else "❌")
-                # Refresh caches
-                get_versions.clear()
-                load_rm_for_report.clear()
-            except Exception as e:
-                st.error(f"Ingestion failed: {e}")
+            msgs = load_uploaded_files(uploads, version_tag=version_tag)
+            for m in msgs:
+                st.toast(m, icon="✅" if m.startswith("✅") else "⚠️" if m.startswith("⚠️") else "❌")
+            # refresh caches
+            get_versions.clear()
+            load_rm_for_report.clear()
 
-    with col_b:
-        if st.button("Scan & load from script folder", use_container_width=True):
-            msgs = scan_script_folder_and_ingest(version_strategy="mtime")
+    with col2:
+        if st.button("Scan & load (script folder)", use_container_width=True):
+            msgs = scan_script_folder_and_ingest()
             for m in msgs:
                 st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
             get_versions.clear()
             load_rm_for_report.clear()
 
-    st.caption(f"Default scan folder: `{SCRIPT_DIR}`")
+    st.caption(f"Script folder: `{SCRIPT_DIR}`")
 
-# Versions available
+# Pull versions
 versions = get_versions()
 if not versions:
-    st.info("No data yet. Upload the **RM Extract** or place `.xlsx` files in the script folder and click **Scan & load from script folder**.")
+    st.info("No data yet. Upload the **RM Extract** (drag & drop) or place `.xlsx` files **next to this script** and click **Scan & load (script folder)**.")
     st.stop()
 
 pick_versions = st.multiselect("Select version(s) for the report", options=versions, default=versions[:1])
@@ -496,7 +504,7 @@ except Exception as e:
     st.stop()
 
 if df_rm.empty:
-    st.warning("No RM data found for selected version(s).")
+    st.warning("No RM data found for the selected version(s).")
     st.stop()
 
 # Filters
@@ -524,9 +532,9 @@ with st.expander("Show filtered rows"):
 st.markdown("---")
 st.markdown(
     "ℹ️ **Notes**\n"
-    "- Each upload is stored with your **version tag** and a **timestamp**. Script‑folder scan uses the file **modified date (UTC)** by default.\n"
-    "- Dates are parsed from `Report_Date` (preferred) or `Month/Year` (Excel serials supported).\n"
-    "- `PO_history.xlsx` is ingested for completeness; the report visualizes **RM Extract** data."
+    "- Folder scan shows **exactly which `.xlsx` files** are detected in the script folder.\n"
+    "- For folder scan, the **version tag** is the file's **modified date (UTC)**; uploads use the textbox value.\n"
+    "- The report uses **RM Extract** (columns: Plant, Plant ID, Material ID, Material Desc, Material Group Desc, Blocked Stock Qty, Month/Year or Report_Date)."
 )
 
 
