@@ -1,5 +1,6 @@
 streamlit==1.33.0
 pandas==2.2.1
 openpyxl==3.1.2
+SQLAlchemy==2.0.28
 plotly==5.19.0
 numpy==1.26.4
