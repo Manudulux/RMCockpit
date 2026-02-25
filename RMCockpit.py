@@ -1,5 +1,6 @@
 # streamlit_app.py
-# Robust Streamlit Cloud app: drag & drop Excel, store in SQLite (sqlite3), and report Blocked Stock Qty
+# Streamlit app: drag & drop Excel, store in SQLite (sqlite3), and report Blocked Stock Qty
+# Includes extra hardening for missing openpyxl and clearer ingestion errors.
 # Author: Emmanuel + Copilot
 
 import io
@@ -29,11 +30,29 @@ REPORT_COLUMNS = [
 ]
 
 # ---------------------------
+# Extra hardening: preflight checks
+# ---------------------------
+# Give a clean error if openpyxl didn't install in Streamlit Cloud
+try:
+    import openpyxl  # noqa: F401
+except Exception as e:
+    st.error(
+        "The **openpyxl** package is required to read `.xlsx` files but is not available.\n\n"
+        "Please ensure `openpyxl` is listed in **requirements.txt**, redeploy the app, and try again.\n\n"
+        f"Details: `{e}`"
+    )
+    st.stop()
+
+# ---------------------------
 # DB helpers (sqlite3)
 # ---------------------------
 def get_conn() -> sqlite3.Connection:
     # Ensure DB file exists
-    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
+    conn = sqlite3.connect(
+        DB_PATH,
+        detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
+        check_same_thread=False,
+    )
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA foreign_keys=ON;")
     return conn
@@ -49,25 +68,29 @@ def ensure_tables(conn: sqlite3.Connection):
             rows_loaded INTEGER NOT NULL
         );
     """)
-    # Data tables are created via pandas to_sql (schema inferred).
+    # Data tables are created dynamically via pandas to_sql.
 
 # ---------------------------
 # Utilities
 # ---------------------------
 def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
-    """Convert Excel serial or string dates → pandas datetime.date."""
+    """Convert Excel serial or string dates → pandas datetime.date (normalized, no time)."""
+    if series is None:
+        return pd.to_datetime(pd.Series([], dtype="float64"), errors="coerce")
+
     s = series.copy()
 
-    # Try numeric first
+    # Try numeric → Excel serial
     s_num = pd.to_numeric(s, errors="coerce")
     dt = pd.to_datetime(s_num, unit="D", origin="1899-12-30", errors="coerce")
 
-    # Fill NaT by attempting standard parse
+    # Fill NaT via normal parsing
     need = dt.isna()
     if need.any():
-        dt2 = pd.to_datetime(s.astype(str), errors="coerce")
+        dt2 = pd.to_datetime(s.astype(str), errors="coerce", dayfirst=False, infer_datetime_format=True)
         dt.loc[need] = dt2.loc[need]
 
+    # Normalize to date (drop time)
     return pd.to_datetime(dt.dt.date, errors="coerce")
 
 def detect_file_kind(file_name: str, df: pd.DataFrame) -> str:
@@ -85,22 +108,64 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
 
     missing = [c for c in REPORT_COLUMNS if c not in df.columns]
     if missing:
-        raise ValueError(f"RM Extract is missing required columns: {missing}")
+        # Show a few available columns to help debugging
+        sample_cols = ", ".join(list(df.columns)[:15])
+        raise ValueError(
+            "RM Extract is missing required columns: "
+            f"{missing}. First columns seen: {sample_cols}"
+        )
 
     # Compute snapshot_date (prefer Report_Date, else Month/Year)
-    if "Report_Date" in df.columns:
-        snap = excel_serial_to_datetime(df["Report_Date"])
-    else:
-        snap = None
-    if snap is None or snap.isna().all():
-        snap = excel_serial_to_datetime(df["Month/Year"])
+    snap = excel_serial_to_datetime(df.get("Report_Date"))
+    if snap.isna().all():
+        snap = excel_serial_to_datetime(df.get("Month/Year"))
     df["snapshot_date"] = snap
 
+    # Coerce numeric for Blocked Stock Qty
     df["Blocked Stock Qty"] = pd.to_numeric(df["Blocked Stock Qty"], errors="coerce").fillna(0.0)
+
+    # Add meta
     df["source_file"] = src_name
     df["version_tag"] = version_tag
     df["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+
+    # Optional: drop obvious empty rows (no snapshot & no material id)
+    if "Material ID" in df.columns:
+        df = df[~(df["snapshot_date"].isna() & df["Material ID"].astype(str).str.strip().eq(""))]
+
     return df
+
+def read_xlsx_all_sheets(uploaded_file) -> pd.DataFrame:
+    """
+    Read all sheets from an uploaded .xlsx file and concat them.
+    Raises a descriptive error on common failure modes.
+    """
+    try:
+        # Let pandas auto-detect engine (requires openpyxl, already preflighted)
+        xls = pd.ExcelFile(uploaded_file)
+    except Exception as e:
+        raise RuntimeError(
+            "Failed to open Excel file. Make sure the file is a valid `.xlsx` workbook. "
+            f"Reader error: {e}"
+        ) from e
+
+    frames = []
+    try:
+        for sh in xls.sheet_names:
+            tmp = xls.parse(sh)
+            if not tmp.empty:
+                tmp["__sheet__"] = sh
+                frames.append(tmp)
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to parse at least one sheet in the workbook. Sheet list: {xls.sheet_names}. "
+            f"Parser error: {e}"
+        ) from e
+
+    if not frames:
+        raise RuntimeError("No non-empty sheets found in the uploaded workbook.")
+
+    return pd.concat(frames, ignore_index=True)
 
 def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
     msgs = []
@@ -110,18 +175,7 @@ def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
     for f in files:
         fname = getattr(f, "name", "uploaded.xlsx")
         try:
-            xls = pd.ExcelFile(f, engine="openpyxl")
-            frames = []
-            for sh in xls.sheet_names:
-                tmp = xls.parse(sh)
-                if not tmp.empty:
-                    tmp["__sheet__"] = sh
-                    frames.append(tmp)
-            if not frames:
-                msgs.append(f"⚠️ {fname}: no data found.")
-                continue
-
-            df_all = pd.concat(frames, ignore_index=True)
+            df_all = read_xlsx_all_sheets(f)
             kind = detect_file_kind(fname, df_all)
 
             if kind == "RM":
@@ -130,7 +184,8 @@ def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
                 # append to RM table
                 df_norm.to_sql(TABLE_RM, conn, if_exists="append", index=False)
                 conn.execute(
-                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) VALUES (?, ?, ?, ?, ?)",
+                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
+                    f"VALUES (?, ?, ?, ?, ?)",
                     (TABLE_RM, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(df_norm.shape[0]))
                 )
                 conn.commit()
@@ -142,7 +197,8 @@ def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
                 df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
                 df_po.to_sql(TABLE_PO, conn, if_exists="append", index=False)
                 conn.execute(
-                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) VALUES (?, ?, ?, ?, ?)",
+                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
+                    f"VALUES (?, ?, ?, ?, ?)",
                     (TABLE_PO, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(df_po.shape[0]))
                 )
                 conn.commit()
@@ -179,6 +235,7 @@ def load_rm_for_report(versions: Optional[List[str]] = None) -> pd.DataFrame:
     else:
         df = pd.read_sql(base_sql, conn, parse_dates=["snapshot_date"])
 
+    # Clean strings
     for c in ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -300,11 +357,13 @@ with st.sidebar:
         accept_multiple_files=True,
         help="Upload 'RM Extract - Data by Month.xlsx' (and optionally 'PO_history.xlsx')."
     )
+
     if st.button("Load files into database", type="primary", use_container_width=True, disabled=(not uploads)):
         try:
             msgs = load_uploaded_files(uploads, version_tag=version_tag)
             for m in msgs:
                 st.toast(m, icon="✅" if m.startswith("✅") else "⚠️" if m.startswith("⚠️") else "❌")
+            # Clear caches so the page reflects new data immediately
             get_versions.clear()
             load_rm_for_report.clear()
         except Exception as e:
@@ -354,6 +413,6 @@ st.markdown("---")
 st.markdown(
     "ℹ️ **Notes**\n"
     "- Each upload is stored with your **version tag** and a **timestamp**.\n"
-    "- Dates are parsed from `Report_Date` (preferred) or `Month/Year`.\n"
+    "- Dates are parsed from `Report_Date` (preferred) or `Month/Year` (Excel serials supported).\n"
     "- `PO_history.xlsx` is ingested for completeness; the chart uses the RM dataset."
 )
