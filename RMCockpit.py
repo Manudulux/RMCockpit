@@ -1,7 +1,6 @@
 # streamlit_app.py
-# Streamlit app: keep ONLY the latest version.
-# On each load action, purge all previous DB rows and Parquet snapshots,
-# then ingest the new files, build MONTHLY inventory evolution from "Month/Year".
+# Streamlit app: Latest-only ingestion with hard table drops to ensure the correct schema,
+# monthly inventory reporting from "Month/Year", optional DuckDB+Parquet fast path.
 # Author: Emmanuel + Copilot
 
 import glob
@@ -55,7 +54,7 @@ except Exception as e:
 opt_mode = st.sidebar.toggle(
     "⚡ Optimized mode (Parquet + DuckDB)",
     value=True,
-    help="Reads per-load Parquet snapshot(s) with DuckDB for faster aggregations. "
+    help="Reads the latest Parquet snapshot with DuckDB for faster aggregations. "
          "If unavailable, the app falls back to SQLite."
 )
 HAVE_DUCKDB = True
@@ -121,20 +120,19 @@ def ensure_indexes(conn: sqlite3.Connection):
     conn.commit()
 
 def purge_all_previous_records(conn: sqlite3.Connection):
-    """Delete ALL existing data & snapshots so only the latest load remains."""
-    with st.spinner("🧹 Purging previous records and snapshots …"):
-        # Drop rows from data tables and log
+    """Hard reset: drop tables + remove Parquet so the new schema is guaranteed to include month_date."""
+    with st.spinner("🧹 Purging previous tables and snapshots …"):
         for tbl in (TABLE_RM, TABLE_PO, TABLE_LOG):
             try:
-                conn.execute(f"DELETE FROM {tbl}")
-            except sqlite3.OperationalError:
-                # table might not exist yet; ignore
+                conn.execute(f"DROP TABLE IF EXISTS {tbl}")
+            except Exception:
                 pass
         conn.commit()
-        # Remove Parquet snapshots
+        # Remove Parquet snapshot(s)
         try:
             for p in PARQUET_DIR.glob("rm_*.parquet"):
                 p.unlink(missing_ok=True)
+            (PARQUET_DIR / "rm_latest.parquet").unlink(missing_ok=True)
         except Exception:
             pass
     st.success("Cleanup complete — only the incoming load will be kept.")
@@ -267,10 +265,10 @@ def to_sql_with_progress(df: pd.DataFrame, table: str, conn: sqlite3.Connection,
     pb.empty()
     return written
 
-def write_parquet_snapshot(df_norm: pd.DataFrame, label: str = "latest") -> str:
+def write_parquet_snapshot(df_norm: pd.DataFrame) -> str:
     """
     Write a Parquet snapshot (for DuckDB fast reads).
-    Only essential columns are persisted. Overwrites previous snapshots to keep only the latest.
+    Only essential columns are persisted. Overwrites previous snapshot to keep only the latest.
     """
     try:
         import pyarrow as pa
@@ -282,29 +280,27 @@ def write_parquet_snapshot(df_norm: pd.DataFrame, label: str = "latest") -> str:
         "Blocked Stock Qty", "month_date"
     ]
     dfp = df_norm[keep].copy()
-    path = PARQUET_DIR / f"rm_latest.parquet"
+    path = PARQUET_DIR / "rm_latest.parquet"
     table = pa.Table.from_pandas(dfp)
     pq.write_table(table, path)
     return str(path)
 
 # -------------------------------------------
-# Ingestion (LATEST ONLY)
+# Ingestion (LATEST ONLY, hard drop)
 # -------------------------------------------
 def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folder_scan: bool = False) -> List[str]:
     """
     Ingest a batch of files:
-      - Purge ALL existing DB rows and Parquet snapshots
+      - DROP TABLES + remove Parquet (latest-only; guarantees schema freshness)
       - Ingest new files (RM normalized monthly + PO raw)
       - Build a single Parquet snapshot named rm_latest.parquet (if optimized mode on)
     """
     msgs_all = []
     conn = get_conn()
+    # hard drop before each batch
+    purge_all_previous_records(conn)
     ensure_tables(conn)
 
-    # 1) Purge everything first (keep ONLY latest)
-    purge_all_previous_records(conn)
-
-    # 2) Process files
     overall = st.progress(0, text="Starting ingestion …")
     total = len(files) if files else 0
     loaded_any_rm = False
@@ -319,10 +315,8 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
             kind = detect_file_kind(fname, df_all)
 
             if kind == "RM":
-                # Version tag for latest-only scenario is purely informational in the log;
-                # we keep only the latest rows anyway.
-                vtag = (datetime.utcfromtimestamp(os.path.getmtime(fname)).strftime("%Y-%m-%d")
-                        if is_folder_scan else version_tag_for_uploads)
+                # For latest-only, version tag is informational only
+                vtag = version_tag_for_uploads
 
                 df_norm = normalize_rm_dataframe(df_all, fname, vtag)
                 rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
@@ -331,7 +325,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
                 loaded_any_rm = True
                 latest_rm_df = df_norm if latest_rm_df is None else pd.concat([latest_rm_df, df_norm], ignore_index=True)
 
-                # Log entry
+                # Log entry (for traceability, even though log table is dropped each batch)
                 conn.execute(
                     f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
                     f"VALUES (?, ?, ?, ?, ?)",
@@ -341,10 +335,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
                 msgs_all.append(f"✅ {fname}: loaded {rows:,} RM row(s).")
 
             else:
-                # PO history stored raw (optional for your reporting)
-                vtag = (datetime.utcfromtimestamp(os.path.getmtime(fname)).strftime("%Y-%m-%d")
-                        if is_folder_scan else version_tag_for_uploads)
-
+                vtag = version_tag_for_uploads
                 df_po = df_all.copy()
                 df_po["source_file"] = fname
                 df_po["version_tag"] = vtag
@@ -366,15 +357,15 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
 
     overall.empty()
 
-    # 3) Indexes for fast reads
+    # Indexes for fast reads
     try:
         ensure_indexes(conn)
     except Exception:
         pass
 
-    # 4) Latest-only Parquet snapshot
-    if loaded_any_rm and opt_mode and HAVE_DUCKDB:
-        path = write_parquet_snapshot(latest_rm_df, label="latest")
+    # Latest-only Parquet snapshot
+    if loaded_any_rm and opt_mode and HAVE_DUCKDB and latest_rm_df is not None:
+        path = write_parquet_snapshot(latest_rm_df)
         if path:
             msgs_all.append(f"💾 Parquet snapshot created: {Path(path).name}")
 
@@ -424,14 +415,22 @@ def scan_script_folder_and_ingest() -> List[str]:
 @st.cache_data(show_spinner=False)
 def load_rm_for_report_sqlite() -> pd.DataFrame:
     conn = get_conn()
-    sql = f"""
-        SELECT
-            "Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc",
-            "Blocked Stock Qty", month_date
-        FROM {TABLE_RM}
-        WHERE month_date IS NOT NULL
-    """
-    df = pd.read_sql(sql, conn, parse_dates=["month_date"])
+    # If table doesn't exist yet, return empty (friendly message shown later)
+    try:
+        df = pd.read_sql(
+            f"""
+            SELECT
+                "Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc",
+                "Blocked Stock Qty", month_date
+            FROM {TABLE_RM}
+            WHERE month_date IS NOT NULL
+            """,
+            conn,
+            parse_dates=["month_date"]
+        )
+    except Exception:
+        return pd.DataFrame()
+
     for c in ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -619,8 +618,7 @@ def render_cut_by_dimensions(df: pd.DataFrame, extend_series: bool):
 # UI
 # -------------------------------------------
 st.title("📦 Blocked Stock Reporting — Monthly (Latest Only)")
-st.caption("On each load, all previous data is purged; only the newest dataset is kept. "
-           "Use Optimized mode for faster analytics on larger files.")
+st.caption("Each load **drops** the previous data and snapshots; only the newest dataset is kept.")
 
 with st.sidebar:
     st.markdown("### 📥 Ingest data (latest-only)")
@@ -649,11 +647,16 @@ with st.sidebar:
 
     with col2:
         if st.button("Scan & load (script folder, overwrite previous)", use_container_width=True):
-            msgs = scan_script_folder_and_ingest()
-            for m in msgs:
-                st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
-            load_rm_for_report_sqlite.clear()
-            load_rm_for_report_duckdb.clear()
+            # Collect .xlsx in script folder and load
+            xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
+            if not xlsx_paths:
+                st.warning(f"No .xlsx files found next to the script in {SCRIPT_DIR}.")
+            else:
+                msgs = scan_script_folder_and_ingest()
+                for m in msgs:
+                    st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
+                load_rm_for_report_sqlite.clear()
+                load_rm_for_report_duckdb.clear()
 
     st.caption(f"Script folder: `{SCRIPT_DIR}`")
 
@@ -672,7 +675,7 @@ except Exception as e:
     st.stop()
 
 if df_rm.empty:
-    st.info("No data available. Load a file set via the sidebar; previous contents are purged each time.")
+    st.info("No data available. Load a file set via the sidebar; previous contents are dropped each time.")
     st.stop()
 
 # Filters
@@ -700,10 +703,9 @@ with st.expander("Show filtered rows"):
 st.markdown("---")
 st.markdown(
     "ℹ️ **Latest-only policy**\n"
-    "- Each ingestion **purges** all previous rows and Parquet snapshots; only the newest dataset remains.\n"
+    "- Each ingestion **drops** all previous rows and snapshot files; only the newest dataset remains.\n"
     "- Time axis is derived from **`Month/Year`** and normalized to the **first day of each month**.\n"
     "- Optimized mode writes/reads a single `rm_latest.parquet` snapshot for speed; otherwise the app reads from SQLite."
 )
-
 
 
