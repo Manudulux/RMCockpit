@@ -1,7 +1,8 @@
 # streamlit_app.py
 # Streamlit app: Latest-only ingestion with auto-load on startup (if DB is empty),
-# monthly inventory reporting from "Month/Year", optional DuckDB+Parquet fast path,
-# and a PO Analysis section (Top 30 by quantity + average/std dev lead-time).
+# monthly inventory reporting from "Month/Year" with global filters above tabs,
+# optional DuckDB+Parquet fast path, and a PO Analysis tab (Top 30 by quantity
+# with Avg / Std Dev lead-time).
 # Author: Emmanuel + Copilot
 
 import glob
@@ -10,7 +11,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple, Dict
 
 import numpy as np
 import pandas as pd
@@ -29,8 +30,9 @@ DB_PATH = os.environ.get("APP_DB_PATH", str(SCRIPT_DIR / "data.db"))
 PARQUET_DIR = SCRIPT_DIR / "parquet"
 PARQUET_DIR.mkdir(exist_ok=True)
 
-TABLE_RM = "rm_inventory_raw"       # normalized RM data (uses 'month_date')
-TABLE_PO = "po_history_raw"         # raw PO history
+TABLE_RM = "rm_inventory_raw"        # normalized RM data (uses 'month_date')
+TABLE_PO_RAW = "po_history_raw"      # raw PO (optional, for traceability)
+TABLE_PO_NORM = "po_history_norm"    # canonical PO table (used by analysis)
 TABLE_LOG = "ingestion_log"
 
 REPORT_COLUMNS = [
@@ -51,7 +53,9 @@ except Exception as e:
     )
     st.stop()
 
-# Optional optimized mode: Parquet + DuckDB (fast analytics)
+# -------------------------------------------
+# Sidebar: Optimized mode + Ingestion controls
+# -------------------------------------------
 opt_mode = st.sidebar.toggle(
     "⚡ Optimized mode (Parquet + DuckDB)",
     value=True,
@@ -65,7 +69,7 @@ if opt_mode:
         import pyarrow as pa  # noqa: F401
         import pyarrow.parquet as pq  # noqa: F401
     except Exception as e:
-        st.warning(
+        st.sidebar.warning(
             "Optimized mode is ON but `duckdb`/`pyarrow` not available; falling back to SQLite.\n\n"
             f"Details: `{e}`"
         )
@@ -112,6 +116,9 @@ def ensure_indexes(conn: sqlite3.Connection):
         f'CREATE INDEX IF NOT EXISTS idx_rm_material_id  ON {TABLE_RM}("Material ID");',
         f'CREATE INDEX IF NOT EXISTS idx_rm_material_desc ON {TABLE_RM}("Material Desc");',
         f'CREATE INDEX IF NOT EXISTS idx_rm_mg_desc      ON {TABLE_RM}("Material Group Desc");',
+        # PO normalized indexes
+        f'CREATE INDEX IF NOT EXISTS idx_po_material     ON {TABLE_PO_NORM}(material_id);',
+        f'CREATE INDEX IF NOT EXISTS idx_po_po_qty       ON {TABLE_PO_NORM}(po_qty);',
     ]
     for sql in idx_sql:
         try:
@@ -121,9 +128,9 @@ def ensure_indexes(conn: sqlite3.Connection):
     conn.commit()
 
 def purge_all_previous_records(conn: sqlite3.Connection):
-    """Hard reset: drop tables + remove Parquet so the new schema includes month_date and only latest data remains."""
+    """Hard reset: drop tables + remove Parquet so the new schema is fresh and latest-only."""
     with st.spinner("🧹 Purging previous tables and snapshots …"):
-        for tbl in (TABLE_RM, TABLE_PO, TABLE_LOG):
+        for tbl in (TABLE_RM, TABLE_PO_RAW, TABLE_PO_NORM, TABLE_LOG):
             try:
                 conn.execute(f"DROP TABLE IF EXISTS {tbl}")
             except Exception:
@@ -141,6 +148,10 @@ def purge_all_previous_records(conn: sqlite3.Connection):
 # -------------------------------------------
 # Utilities
 # -------------------------------------------
+def _norm_header(s: str) -> str:
+    """normalize header for robust matching"""
+    return str(s).strip().lower().replace(" ", "").replace("_", "").replace(".", "")
+
 def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
     """Convert Excel serial or string dates → pandas datetime.date (normalized)."""
     if series is None:
@@ -169,14 +180,8 @@ def detect_file_kind(file_name: str, df: pd.DataFrame) -> str:
         return "RM"
     return "PO"
 
+# ---------- RM normalize ----------
 def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) -> pd.DataFrame:
-    """
-    Normalize RM data:
-      - Parse Month/Year → month_date (first day of month)
-      - Keep only needed columns
-      - Numeric conversion; trim strings
-      - Drop invalids and de-dupe inside batch
-    """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -219,6 +224,87 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
 
     return df
 
+# ---------- PO normalize ----------
+def normalize_po_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) -> pd.DataFrame:
+    """
+    Normalize PO history to a canonical schema the analysis can always rely on:
+      po_number, material_id, po_creation_date, gr_date, po_qty, vendor, plant,
+      short_text, currency, net_price, lead_time_days
+    """
+    raw = df.copy()
+    # Trim headers
+    raw.columns = [c.strip() for c in raw.columns]
+    # Build normalized-header map
+    header_map = {_norm_header(c): c for c in raw.columns}
+
+    def pick(*cands: str) -> Optional[str]:
+        """Pick first existing source column among candidates using relaxed matching."""
+        for cand in cands:
+            key = _norm_header(cand)
+            if key in header_map:
+                return header_map[key]
+        # fallback: scan relaxed keys for partials
+        for c in raw.columns:
+            if _norm_header(c) in [_norm_header(x) for x in cands]:
+                return c
+        return None
+
+    col_po     = pick("PO Number", "PurDoc", "PO", "EBELN")
+    col_mat    = pick("Material ID", "Material")
+    col_cdate  = pick("PO Creation Date", "Created On", "Doc. Date")
+    col_grdate = pick("Goods Receipt Date", "Actual GR Date", "GR Date")
+    col_qty    = pick("PO qty", "PO Qty", "Order Qty", "Quantity")
+    col_vendor = pick("Vendor", "Supplier")
+    col_plant  = pick("Plant", "Plnt", "Plant ID")
+    col_text   = pick("Short Text", "Material Desc", "Description")
+    col_curr   = pick("Crcy", "Currency")
+    col_price  = pick("Net Price", "Price")
+
+    # If essential columns are missing, return empty df -> app will inform user
+    essentials = [col_mat, col_cdate, col_grdate, col_qty]
+    if any(c is None for c in essentials):
+        return pd.DataFrame(columns=[
+            "po_number","material_id","po_creation_date","gr_date","po_qty",
+            "vendor","plant","short_text","currency","net_price","lead_time_days",
+            "source_file","version_tag","uploaded_at_utc"
+        ])
+
+    out = pd.DataFrame()
+    out["po_number"] = (raw[col_po] if col_po else raw.index).astype(str)
+    out["material_id"] = raw[col_mat].astype(str).str.strip()
+    out["po_creation_date"] = excel_serial_to_datetime(raw[col_cdate])
+    out["gr_date"] = excel_serial_to_datetime(raw[col_grdate])
+    out["po_qty"] = pd.to_numeric(raw[col_qty], errors="coerce")
+    if col_vendor: out["vendor"] = raw[col_vendor].astype(str).str.strip()
+    else:          out["vendor"] = ""
+    if col_plant:  out["plant"]  = raw[col_plant].astype(str).str.strip()
+    else:          out["plant"]  = ""
+    if col_text:   out["short_text"] = raw[col_text].astype(str).str.strip()
+    else:          out["short_text"] = ""
+    if col_curr:   out["currency"] = raw[col_curr].astype(str).str.strip()
+    else:          out["currency"] = ""
+    if col_price:  out["net_price"] = pd.to_numeric(raw[col_price], errors="coerce")
+    else:          out["net_price"] = np.nan
+
+    # Compute lead-time (days)
+    out["lead_time_days"] = (out["gr_date"] - out["po_creation_date"]).dt.days
+
+    # Keep only valid lines for analysis (have both dates and a qty)
+    out = out.dropna(subset=["po_creation_date", "gr_date", "po_qty"])
+    # Add meta
+    out["source_file"] = src_name
+    out["version_tag"] = version_tag
+    out["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+
+    # De-duplicate: if duplicates occur, keep the last
+    out = out.drop_duplicates(
+        subset=["po_number", "material_id", "po_creation_date", "gr_date", "po_qty"],
+        keep="last"
+    )
+
+    return out
+
+# ---------- IO helpers ----------
 def read_xlsx_all_sheets(uploaded_file) -> pd.DataFrame:
     """Read and concat all non-empty sheets; raise clear errors if reading fails."""
     try:
@@ -293,7 +379,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[
     """
     Ingest a batch of files:
       - DROP TABLES + remove Parquet (latest-only; guarantees schema freshness)
-      - Ingest new files (RM normalized monthly + PO raw)
+      - Ingest new files (RM normalized monthly + PO raw + PO normalized)
       - Build a single Parquet snapshot named rm_latest.parquet (if optimized mode on)
     """
     msgs_all = []
@@ -307,6 +393,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[
     loaded_any_rm = False
     latest_rm_rows = 0
     latest_rm_df = None
+    po_norm_df_all = []  # accumulate to one normalized table
 
     for i, f in enumerate(files, start=1):
         fname = getattr(f, "name", "uploaded.xlsx")
@@ -319,12 +406,10 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[
                 vtag = version_tag_for_uploads
                 df_norm = normalize_rm_dataframe(df_all, fname, vtag)
                 rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
-
                 latest_rm_rows += rows
                 loaded_any_rm = True
                 latest_rm_df = df_norm if latest_rm_df is None else pd.concat([latest_rm_df, df_norm], ignore_index=True)
-
-                # Log entry (for traceability; note: log table is recreated each batch)
+                # Log entry
                 conn.execute(
                     f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
                     f"VALUES (?, ?, ?, ?, ?)",
@@ -335,18 +420,26 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[
 
             else:
                 vtag = version_tag_for_uploads
-                df_po = df_all.copy()
-                df_po["source_file"] = fname
-                df_po["version_tag"] = vtag
-                df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
-                rows = to_sql_with_progress(df_po, TABLE_PO, conn, label=fname)
+                # store raw for traceability
+                df_raw = df_all.copy()
+                df_raw["source_file"] = fname
+                df_raw["version_tag"] = vtag
+                df_raw["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+                rows_raw = to_sql_with_progress(df_raw, TABLE_PO_RAW, conn, label=fname)
                 conn.execute(
                     f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
                     f"VALUES (?, ?, ?, ?, ?)",
-                    (TABLE_PO, fname, vtag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
+                    (TABLE_PO_RAW, fname, vtag, datetime.utcnow().isoformat(timespec="seconds"), int(rows_raw))
                 )
                 conn.commit()
-                msgs_all.append(f"✅ {fname}: loaded {rows:,} PO row(s).")
+
+                # normalize PO into canonical schema (po_history_norm)
+                df_po_norm = normalize_po_dataframe(df_all, fname, vtag)
+                if not df_po_norm.empty:
+                    po_norm_df_all.append(df_po_norm)
+                    msgs_all.append(f"✅ {fname}: normalized {len(df_po_norm):,} PO row(s).")
+                else:
+                    msgs_all.append(f"⚠️ {fname}: PO file lacked essential columns (Material, Dates, Qty) or had no valid rows.")
 
         except Exception as e:
             msgs_all.append(f"❌ {fname}: ingestion failed — {e!s}")
@@ -356,13 +449,19 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[
 
     overall.empty()
 
+    # Write accumulated normalized PO in one go (fewer commits → faster)
+    if po_norm_df_all:
+        df_norm_all = pd.concat(po_norm_df_all, ignore_index=True)
+        _ = to_sql_with_progress(df_norm_all, TABLE_PO_NORM, conn, label="PO normalized (all)")
+        conn.commit()
+
     # Indexes for fast reads
     try:
         ensure_indexes(conn)
     except Exception:
         pass
 
-    # Latest-only Parquet snapshot
+    # Latest-only Parquet snapshot for RM
     if loaded_any_rm and opt_mode and HAVE_DUCKDB and latest_rm_df is not None:
         path = write_parquet_snapshot(latest_rm_df)
         if path:
@@ -373,6 +472,14 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[
         msgs_all.append(f"✅ Finished. Kept only the latest RM dataset with {latest_rm_rows:,} row(s).")
     else:
         msgs_all.append("⚠️ No RM data detected in this batch — database is empty (latest-only policy).")
+
+    # PO summary
+    conn.commit()
+    try:
+        po_cnt = pd.read_sql(f"SELECT COUNT(*) AS n FROM {TABLE_PO_NORM}", conn)["n"].iloc[0]
+        msgs_all.append(f"🧾 PO normalized rows available: {po_cnt:,}")
+    except Exception:
+        msgs_all.append("⚠️ No normalized PO rows available.")
 
     return msgs_all
 
@@ -462,156 +569,101 @@ def load_rm_for_report() -> pd.DataFrame:
     return load_rm_for_report_duckdb() if (opt_mode and HAVE_DUCKDB) else load_rm_for_report_sqlite()
 
 # -------------------------------------------
-# PO Analysis helpers
+# PO Analysis helpers (use normalized table)
 # -------------------------------------------
-def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+@st.cache_data(show_spinner=False)
+def po_material_choices_from_norm() -> List[str]:
+    conn = get_conn()
     try:
-        cur = conn.execute(f'PRAGMA table_info("{table}")')
-        cols = [r[1] for r in cur.fetchall()]
-        return cols
+        df = pd.read_sql(f'SELECT DISTINCT material_id FROM {TABLE_PO_NORM} WHERE material_id IS NOT NULL LIMIT 50000', conn)
+        return sorted(df["material_id"].astype(str).str.strip().unique().tolist())
     except Exception:
         return []
 
-def _find_col(cols: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
-    cols_lc = {c.lower(): c for c in cols}
-    for cand in candidates:
-        key = cand.lower()
-        if key in cols_lc:
-            return cols_lc[key]
-    # try relaxed match (remove spaces / underscores)
-    relaxed = {c.lower().replace(" ", "").replace("_", ""): c for c in cols}
-    for cand in candidates:
-        key = cand.lower().replace(" ", "").replace("_", "")
-        if key in relaxed:
-            return relaxed[key]
-    return None
-
-def load_po_material_choices() -> Tuple[List[str], dict]:
-    """Return a sorted list of material IDs and a mapping of canonical names actually present."""
+@st.cache_data(show_spinner=False)
+def load_po_top30_for_material(material_id: str) -> pd.DataFrame:
+    """Return Top 30 POs by po_qty for a material from normalized table."""
     conn = get_conn()
-    cols = get_table_columns(conn, TABLE_PO)
-    if not cols:
-        return [], {}
-
-    material_col = _find_col(cols, ["Material ID", "Material"])
-    if material_col is None:
-        return [], {}
-
-    # fetch distinct materials (limit to keep UI snappy if huge)
-    df = pd.read_sql(f'SELECT DISTINCT "{material_col}" AS material FROM {TABLE_PO} WHERE "{material_col}" IS NOT NULL LIMIT 20000', conn)
-    materials = sorted(df["material"].astype(str).str.strip().unique().tolist())
-
-    # build a mapping of useful columns we may later extract
-    mapping = {
-        "material": material_col,
-        "po_number": _find_col(cols, ["PO Number", "PurDoc", "PO", "EBELN"]),
-        "creation_date": _find_col(cols, ["PO Creation Date", "Created On", "Doc. Date"]),
-        "gr_date": _find_col(cols, ["Goods Receipt Date", "Actual GR Date", "GR Date"]),
-        "qty": _find_col(cols, ["PO qty", "PO Qty", "Order Qty", "Quantity"]),
-        "vendor": _find_col(cols, ["Vendor", "Supplier"]),
-        "plant": _find_col(cols, ["Plant", "Plnt", "Plant ID"]),
-        "short_text": _find_col(cols, ["Short Text", "Material Desc", "Description"]),
-        "currency": _find_col(cols, ["Crcy", "Currency"]),
-        "net_price": _find_col(cols, ["Net Price", "Price"]),
-    }
-    return materials, mapping
-
-def _parse_date_series(s: pd.Series) -> pd.Series:
-    # handle either Excel serials or text dates
-    return excel_serial_to_datetime(s)
-
-def load_po_for_material(material_id: str, mapping: dict) -> pd.DataFrame:
-    """Load PO rows for a given material with essential columns; compute lead-time."""
-    conn = get_conn()
-    mcol = mapping.get("material")
-    if not mcol:
+    try:
+        df = pd.read_sql(
+            f"""
+            SELECT
+              po_number, material_id, po_creation_date, gr_date, po_qty,
+              vendor, plant, short_text, currency, net_price, lead_time_days
+            FROM {TABLE_PO_NORM}
+            WHERE material_id = ?
+            """,
+            conn,
+            params=[material_id],
+            parse_dates=["po_creation_date", "gr_date"]
+        )
+    except Exception:
         return pd.DataFrame()
 
-    # Build the SELECT only with available columns
-    select_cols = [c for c in [
-        mapping.get("po_number") or "rowid",
-        mcol,
-        mapping.get("creation_date"),
-        mapping.get("gr_date"),
-        mapping.get("qty"),
-        mapping.get("vendor"),
-        mapping.get("plant"),
-        mapping.get("short_text"),
-        mapping.get("currency"),
-        mapping.get("net_price"),
-    ] if c is not None]
+    # Ensure types
+    if "po_qty" in df.columns:
+        df["po_qty"] = pd.to_numeric(df["po_qty"], errors="coerce")
 
-    select_sql_cols = ", ".join([f'"{c}"' if c != "rowid" else "rowid" for c in select_cols])
-    sql = f'SELECT {select_sql_cols} FROM {TABLE_PO} WHERE "{mcol}" = ?'
-    df = pd.read_sql(sql, conn, params=[material_id])
-
-    # Rename to canonical names where possible for UI clarity
-    ren = {}
-    if mapping.get("po_number"): ren[mapping["po_number"]] = "PO Number"
-    ren[mcol] = "Material ID"
-    if mapping.get("creation_date"): ren[mapping["creation_date"]] = "PO Creation Date"
-    if mapping.get("gr_date"): ren[mapping["gr_date"]] = "Goods Receipt Date"
-    if mapping.get("qty"): ren[mapping["qty"]] = "PO Qty"
-    if mapping.get("vendor"): ren[mapping["vendor"]] = "Vendor"
-    if mapping.get("plant"): ren[mapping["plant"]] = "Plant"
-    if mapping.get("short_text"): ren[mapping["short_text"]] = "Short Text"
-    if mapping.get("currency"): ren[mapping["currency"]] = "Currency"
-    if mapping.get("net_price"): ren[mapping["net_price"]] = "Net Price"
-    df = df.rename(columns=ren)
-
-    # Parse dates & compute lead-time (days)
-    if "PO Creation Date" in df.columns:
-        df["PO Creation Date"] = _parse_date_series(df["PO Creation Date"])
-    else:
-        df["PO Creation Date"] = pd.NaT
-
-    if "Goods Receipt Date" in df.columns:
-        df["Goods Receipt Date"] = _parse_date_series(df["Goods Receipt Date"])
-    else:
-        df["Goods Receipt Date"] = pd.NaT
-
-    df["lead_time_days"] = (df["Goods Receipt Date"] - df["PO Creation Date"]).dt.days
-
-    # Qty numeric
-    if "PO Qty" in df.columns:
-        df["PO Qty"] = pd.to_numeric(df["PO Qty"], errors="coerce")
-    else:
-        df["PO Qty"] = np.nan
-
-    # Clean up PO Number if missing
-    if "PO Number" not in df.columns:
-        df["PO Number"] = df.index.astype(str)
-
-    # Drop rows without dates or qty for the lead-time analysis
-    df = df.dropna(subset=["PO Creation Date", "Goods Receipt Date", "lead_time_days", "PO Qty"])
+    # Keep valid rows only
+    df = df.dropna(subset=["po_creation_date", "gr_date", "lead_time_days", "po_qty"])
+    df = df.sort_values("po_qty", ascending=False).head(30)
     return df
 
 # -------------------------------------------
-# Filtering & Charts (RM)
+# RM: Filters (rendered ABOVE tabs)
 # -------------------------------------------
-def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
-    st.sidebar.markdown("### 🔎 Filters")
+def render_global_filters(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, List[str]]]:
+    """
+    Render global filters for RM dataset on top of the page and return filtered dataframe
+    plus the selected filter values (for potential future use).
+    """
+    st.subheader("🔎 Filters (RM dataset)")
+    # Build options
+    plant_opt   = sorted(df["Plant"].dropna().astype(str).unique().tolist()) if "Plant" in df else []
+    plant_id_opt= sorted(df["Plant ID"].dropna().astype(str).unique().tolist()) if "Plant ID" in df else []
+    mat_id_opt  = sorted(df["Material ID"].dropna().astype(str).unique().tolist()) if "Material ID" in df else []
+    mat_desc_opt= sorted(df["Material Desc"].dropna().astype(str).unique().tolist()) if "Material Desc" in df else []
+    mg_opt      = sorted(df["Material Group Desc"].dropna().astype(str).unique().tolist()) if "Material Group Desc" in df else []
 
-    plant = st.sidebar.multiselect("Plant", sorted(df["Plant"].dropna().unique().tolist()))
-    plant_id = st.sidebar.multiselect("Plant ID", sorted(df["Plant ID"].dropna().unique().tolist()))
-    material_id = st.sidebar.multiselect("Material ID", sorted(df["Material ID"].dropna().unique().tolist()))
-    material_desc = st.sidebar.multiselect("Material Desc", sorted(df["Material Desc"].dropna().unique().tolist()))
-    mg_desc = st.sidebar.multiselect("Material Group Desc", sorted(df["Material Group Desc"].dropna().unique().tolist()))
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sel_plant = st.multiselect("Plant", plant_opt)
+    with c2:
+        sel_plant_id = st.multiselect("Plant ID", plant_id_opt)
+    with c3:
+        sel_mg = st.multiselect("Material Group Desc", mg_opt)
 
+    c4, c5 = st.columns(2)
+    with c4:
+        sel_mat_id = st.multiselect("Material ID", mat_id_opt)
+    with c5:
+        sel_mat_desc = st.multiselect("Material Desc", mat_desc_opt)
+
+    # Apply filters
     mask = pd.Series(True, index=df.index)
-    if plant:
-        mask &= df["Plant"].isin(plant)
-    if plant_id:
-        mask &= df["Plant ID"].isin(plant_id)
-    if material_id:
-        mask &= df["Material ID"].isin(material_id)
-    if material_desc:
-        mask &= df["Material Desc"].isin(material_desc)
-    if mg_desc:
-        mask &= df["Material Group Desc"].isin(mg_desc)
+    if sel_plant:
+        mask &= df["Plant"].isin(sel_plant)
+    if sel_plant_id:
+        mask &= df["Plant ID"].isin(sel_plant_id)
+    if sel_mat_id:
+        mask &= df["Material ID"].isin(sel_mat_id)
+    if sel_mat_desc:
+        mask &= df["Material Desc"].isin(sel_mat_desc)
+    if sel_mg:
+        mask &= df["Material Group Desc"].isin(sel_mg)
 
-    return df.loc[mask].copy()
+    df_f = df.loc[mask].copy()
+    return df_f, {
+        "Plant": sel_plant,
+        "Plant ID": sel_plant_id,
+        "Material ID": sel_mat_id,
+        "Material Desc": sel_mat_desc,
+        "Material Group Desc": sel_mg,
+    }
 
+# -------------------------------------------
+# RM: Charts
+# -------------------------------------------
 def extend_to_current_month(ts: pd.DataFrame, value_col: str) -> pd.DataFrame:
     """
     Reindex monthly time series to run through the current month and forward-fill values (global series).
@@ -627,7 +679,7 @@ def extend_to_current_month(ts: pd.DataFrame, value_col: str) -> pd.DataFrame:
     return g
 
 def render_time_series(df: pd.DataFrame, extend_series: bool):
-    st.markdown("### 📈 Blocked Stock Qty — Monthly Inventory Evolution")
+    st.markdown("#### 📈 Blocked Stock Qty — Monthly Inventory Evolution")
 
     if df.empty:
         st.info("No data after filters.")
@@ -739,7 +791,7 @@ def render_cut_by_dimensions(df: pd.DataFrame, extend_series: bool):
         st.dataframe(view, use_container_width=True)
 
 # -------------------------------------------
-# UI – ingestion controls
+# UI – ingestion controls (sidebar)
 # -------------------------------------------
 st.title("📦 Blocked Stock Reporting — Monthly (Latest Only)")
 st.caption("Each load **drops** the previous data and snapshots; only the newest dataset is kept.")
@@ -756,7 +808,7 @@ with st.sidebar:
         "Upload Excel (.xlsx)",
         type=["xlsx"],
         accept_multiple_files=True,
-        help="Upload 'RM Extract - Data by Month.xlsx' (and optionally 'PO_history.xlsx')."
+        help="Upload 'RM Extract - Data by Month.xlsx' and 'PO_history.xlsx' (or similarly named files)."
     )
 
     col1, col2 = st.columns(2)
@@ -768,6 +820,8 @@ with st.sidebar:
             # refresh caches
             load_rm_for_report_sqlite.clear()
             load_rm_for_report_duckdb.clear()
+            po_material_choices_from_norm.clear()
+            load_po_top30_for_material.clear()
 
     with col2:
         if st.button("Scan & load (script folder, overwrite previous)", use_container_width=True):
@@ -780,21 +834,14 @@ with st.sidebar:
                     st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
                 load_rm_for_report_sqlite.clear()
                 load_rm_for_report_duckdb.clear()
+                po_material_choices_from_norm.clear()
+                load_po_top30_for_material.clear()
 
     st.caption(f"Script folder: `{SCRIPT_DIR}`")
-
-st.markdown("### ⚙️ Chart options")
-extend_series = st.checkbox(
-    "Extend to current month (forward‑fill last known value)",
-    value=True,
-    help="Reindexes the monthly series through the current month and forward‑fills."
-)
 
 # ----------------------------------------------------------
 # AUTO-LOAD ON STARTUP WHEN DB IS EMPTY (recommended)
 # ----------------------------------------------------------
-# If no RM table or it's empty, and .xlsx files exist next to the script,
-# auto-trigger the folder ingestion ONCE.
 initial_check_conn = get_conn()
 try:
     existing = pd.read_sql(
@@ -805,7 +852,6 @@ try:
 except Exception:
     rm_count = 0  # table does not exist yet
 
-# Auto-trigger only if database is empty
 if rm_count == 0:
     xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
     if xlsx_paths:
@@ -813,9 +859,10 @@ if rm_count == 0:
         msgs = scan_script_folder_and_ingest()
         for m in msgs:
             st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
-        # Clear caches so freshly loaded data is visible
         load_rm_for_report_sqlite.clear()
         load_rm_for_report_duckdb.clear()
+        po_material_choices_from_norm.clear()
+        load_po_top30_for_material.clear()
 
 # -------------------------------------------
 # Load latest-only RM data for reporting
@@ -830,100 +877,106 @@ if df_rm.empty:
     st.info("No data available. Ensure `.xlsx` files are next to the script or upload via the sidebar. Previous contents are dropped each time.")
     st.stop()
 
-# Filters
-df_filtered = apply_filters(df_rm)
+# -------------------------------------------
+# Global controls ABOVE tabs
+# -------------------------------------------
+st.markdown("### ⚙️ Chart options")
+extend_series = st.checkbox(
+    "Extend to current month (forward‑fill last known value)",
+    value=True,
+    help="Reindexes the monthly series through the current month and forward‑fills."
+)
 
-# KPIs
-c1, c2, c3 = st.columns(3)
-c1.metric("Rows (after filters)", f"{len(df_filtered):,}")
-c2.metric("Months", df_filtered["month_date"].nunique())
-c3.metric("Blocked Stock Total", f"{df_filtered['Blocked Stock Qty'].sum():,.2f}")
+# Render global filters for RM and get filtered df
+df_filtered, selected_filters = render_global_filters(df_rm)
 
-# Charts
-render_time_series(df_filtered, extend_series=extend_series)
-render_cut_by_dimensions(df_filtered, extend_series=extend_series)
+# -------------------------------------------
+# TABS
+# -------------------------------------------
+tab1, tab2 = st.tabs(["📦 Blocked Stock", "📑 PO Analysis"])
 
-with st.expander("Show filtered rows"):
-    st.dataframe(df_filtered.sort_values(["month_date"]), use_container_width=True, height=400)
-    st.download_button(
-        "Download filtered CSV",
-        df_filtered.to_csv(index=False).encode("utf-8"),
-        file_name="blocked_stock_filtered_latest.csv",
-        mime="text/csv"
-    )
+with tab1:
+    # KPIs
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Rows (after filters)", f"{len(df_filtered):,}")
+    c2.metric("Months", df_filtered["month_date"].nunique())
+    c3.metric("Blocked Stock Total", f"{df_filtered['Blocked Stock Qty'].sum():,.2f}")
 
-st.markdown("---")
+    # Charts
+    render_time_series(df_filtered, extend_series=extend_series)
+    render_cut_by_dimensions(df_filtered, extend_series=extend_series)
 
-# ===========================================
-# 🆕 PO ANALYSIS SECTION
-# ===========================================
-st.header("📑 PO Analysis (Top 30 by Quantity)")
+    with st.expander("Show filtered rows"):
+        st.dataframe(df_filtered.sort_values(["month_date"]), use_container_width=True, height=400)
+        st.download_button(
+            "Download filtered CSV",
+            df_filtered.to_csv(index=False).encode("utf-8"),
+            file_name="blocked_stock_filtered_latest.csv",
+            mime="text/csv"
+        )
 
-materials, po_mapping = load_po_material_choices()
-if not materials:
-    st.info("PO data not available yet (or missing required columns like Material / Dates / Quantity). Load PO history and try again.")
-else:
-    colA, colB = st.columns([2, 1])
-    with colA:
-        mat_choice = st.selectbox("Select Material ID (from PO history)", options=materials, index=0)
-    with colB:
-        go_btn = st.button("Show PO analysis", type="primary", use_container_width=True)
+with tab2:
+    st.markdown("Select a material to analyze the **Top 30 POs by quantity** and compute **Avg / Std Dev lead‑time** (GR − Creation).")
+    material_options = po_material_choices_from_norm()
+    if not material_options:
+        st.info("PO data not available (normalized table is empty). "
+                "Please ensure a PO .xlsx was included during ingestion.")
+    else:
+        colA, colB = st.columns([2, 1])
+        with colA:
+            mat_choice = st.selectbox("Material ID (from PO history)", options=material_options, index=0)
+        with colB:
+            go = st.button("Show PO analysis", type="primary", use_container_width=True)
 
-    if go_btn:
-        df_po = load_po_for_material(mat_choice, po_mapping)
-        if df_po.empty:
-            st.warning("No valid PO rows found for this material with usable dates and quantity.")
-        else:
-            # Top 30 by PO Qty
-            top = df_po.sort_values("PO Qty", ascending=False).head(30).copy()
+        if go:
+            df_po_top = load_po_top30_for_material(mat_choice)
+            if df_po_top.empty:
+                st.warning("No valid PO lines found for this material (with dates and quantity).")
+            else:
+                # KPIs
+                avg_lt = float(np.nanmean(df_po_top["lead_time_days"])) if len(df_po_top) else np.nan
+                std_lt = float(np.nanstd(df_po_top["lead_time_days"], ddof=1)) if len(df_po_top) > 1 else np.nan
 
-            # KPIs
-            avg_lt = float(np.nanmean(top["lead_time_days"])) if len(top) else np.nan
-            std_lt = float(np.nanstd(top["lead_time_days"], ddof=1)) if len(top) > 1 else np.nan
+                k1, k2, k3 = st.columns(3)
+                with k1:
+                    st.metric("PO lines (top set)", f"{len(df_po_top):,}")
+                with k2:
+                    st.metric("Avg Lead‑Time (days)", f"{avg_lt:,.1f}" if np.isfinite(avg_lt) else "—")
+                with k3:
+                    st.metric("Std Dev Lead‑Time", f"{std_lt:,.1f}" if np.isfinite(std_lt) else "—")
 
-            k1, k2, k3 = st.columns(3)
-            with k1:
-                st.metric("PO lines (top set)", f"{len(top):,}")
-            with k2:
-                st.metric("Avg Lead‑Time (days)", f"{avg_lt:,.1f}" if np.isfinite(avg_lt) else "—")
-            with k3:
-                st.metric("Std Dev Lead‑Time", f"{std_lt:,.1f}" if np.isfinite(std_lt) else "—")
+                # Table
+                show_cols = [c for c in [
+                    "po_number", "material_id", "po_creation_date", "gr_date",
+                    "lead_time_days", "po_qty", "vendor", "plant", "short_text", "currency", "net_price"
+                ] if c in df_po_top.columns]
+                st.dataframe(df_po_top[show_cols], use_container_width=True, height=420)
 
-            # Table view
-            show_cols = [c for c in [
-                "PO Number", "Material ID", "PO Creation Date", "Goods Receipt Date",
-                "lead_time_days", "PO Qty", "Vendor", "Plant", "Short Text", "Currency", "Net Price"
-            ] if c in top.columns]
-            st.dataframe(top[show_cols], use_container_width=True, height=420)
+                st.download_button(
+                    "Download Top 30 PO lines (CSV)",
+                    df_po_top[show_cols].to_csv(index=False).encode("utf-8"),
+                    file_name=f"po_top30_{mat_choice}.csv",
+                    mime="text/csv"
+                )
 
-            st.download_button(
-                "Download Top 30 PO lines (CSV)",
-                top[show_cols].to_csv(index=False).encode("utf-8"),
-                file_name=f"po_top30_{mat_choice}.csv",
-                mime="text/csv"
-            )
-
-            # Chart: lead-time vs PO (sorted by quantity)
-            import plotly.express as px
-            top_plot = top.sort_values(["PO Qty", "lead_time_days"], ascending=[False, True]).copy()
-            top_plot["PO Number"] = top_plot["PO Number"].astype(str)
-            fig = px.bar(
-                top_plot,
-                x="PO Number",
-                y="lead_time_days",
-                hover_data=show_cols,
-                title=f"Lead‑Time (days) by PO — Top 30 by Quantity for {mat_choice}",
-                labels={"lead_time_days": "Lead‑Time (days)", "PO Number": "PO Number"},
-            )
-            fig.update_layout(xaxis_tickangle=-45, height=460)
-            st.plotly_chart(fig, use_container_width=True)
+                # Chart: lead-time vs PO (sorted by quantity)
+                import plotly.express as px
+                plot_df = df_po_top.sort_values(["po_qty", "lead_time_days"], ascending=[False, True]).copy()
+                plot_df["po_number"] = plot_df["po_number"].astype(str)
+                fig = px.bar(
+                    plot_df,
+                    x="po_number",
+                    y="lead_time_days",
+                    hover_data=show_cols,
+                    title=f"Lead‑Time (days) by PO — Top 30 by Quantity for {mat_choice}",
+                    labels={"lead_time_days": "Lead‑Time (days)", "po_number": "PO Number"},
+                )
+                fig.update_layout(xaxis_tickangle=-45, height=460)
+                st.plotly_chart(fig, use_container_width=True)
 
 st.markdown(
     "ℹ️ **Notes**\n"
-    "- Lead‑time is computed as **Goods Receipt Date − PO Creation Date** (in days).\n"
-    "- Column name variants are supported (e.g., *Created On* / *Actual GR Date* / *PO qty*).\n"
-    "- The PO view uses the **latest-only dataset** (reloaded on each ingestion)."
+    "- **Latest-only**: each ingestion **drops** previous rows and snapshots; only the newest dataset remains.\n"
+    "- The monthly axis is derived from **`Month/Year`** and normalized to the **first day of each month**.\n"
+    "- PO lead‑time is **Goods Receipt Date − PO Creation Date** (days). Column name variants are normalized automatically."
 )
-
-
-
