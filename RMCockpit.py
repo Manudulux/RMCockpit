@@ -1,51 +1,45 @@
 # streamlit_app.py
-# Streamlit app to ingest Excel files into SQLite and report on Blocked Stock Qty evolution
+# Robust Streamlit Cloud app: drag & drop Excel, store in SQLite (sqlite3), and report Blocked Stock Qty
 # Author: Emmanuel + Copilot
 
 import io
 import os
+import sqlite3
 from datetime import datetime
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-import sqlalchemy as sa
 import streamlit as st
 
-# -------------------------------------
-# Config
-# -------------------------------------
-st.set_page_config(
-    page_title="Blocked Stock Report",
-    page_icon="📦",
-    layout="wide"
-)
+# ---------------------------
+# Page config
+# ---------------------------
+st.set_page_config(page_title="Blocked Stock Report", page_icon="📦", layout="wide")
 
-# SQLite DB on Streamlit Cloud is persisted between sessions (as long as the app keeps the same container)
 DB_PATH = os.environ.get("APP_DB_PATH", "data.db")
 
-# Tables
-TABLE_RM = "rm_inventory_raw"       # from: "RM Extract - Data by Month.xlsx"
-TABLE_PO = "po_history_raw"         # from: "PO_history.xlsx"
+TABLE_RM = "rm_inventory_raw"       # normalized for reporting
+TABLE_PO = "po_history_raw"         # raw storage (logged), not used for the chart
 TABLE_LOG = "ingestion_log"
 
-# Columns we need for the report
 REPORT_COLUMNS = [
     "Month/Year", "Report_Date", "Plant", "Plant ID", "Material ID",
     "Material Desc", "Material Group Desc", "Blocked Stock Qty"
 ]
 
-# -------------------------------------
-# Helpers
-# -------------------------------------
-@st.cache_resource(show_spinner=False)
-def get_engine():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) if "/" in DB_PATH else None
-    return sa.create_engine(f"sqlite:///{DB_PATH}", future=True)
+# ---------------------------
+# DB helpers (sqlite3)
+# ---------------------------
+def get_conn() -> sqlite3.Connection:
+    # Ensure DB file exists
+    conn = sqlite3.connect(DB_PATH, detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+    return conn
 
-def ensure_tables(engine: sa.Engine):
-    with engine.begin() as con:
-        con.exec_driver_sql(f"""
+def ensure_tables(conn: sqlite3.Connection):
+    conn.execute(f"""
         CREATE TABLE IF NOT EXISTS {TABLE_LOG} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             table_name TEXT NOT NULL,
@@ -54,96 +48,68 @@ def ensure_tables(engine: sa.Engine):
             uploaded_at_utc TEXT NOT NULL,
             rows_loaded INTEGER NOT NULL
         );
-        """)
-        # We intentionally do NOT precreate rm/po tables with fixed schema—pandas will create them on first load
-        # because headers sometimes change. We do, however, consistently add meta columns below.
+    """)
+    # Data tables are created via pandas to_sql (schema inferred).
 
+# ---------------------------
+# Utilities
+# ---------------------------
 def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
-    """
-    Convert Excel serial numbers to pandas datetime.
-    Handles decimals (fractional days) and returns date at day precision.
-    If string dates are present, falls back to to_datetime.
-    """
+    """Convert Excel serial or string dates → pandas datetime.date."""
     s = series.copy()
-    # Attempt numeric conversion first
-    if not np.issubdtype(s.dtype, np.number):
-        # try to coerce non-numeric into numeric (for mixed columns)
-        s_numeric = pd.to_numeric(s, errors="coerce")
-    else:
-        s_numeric = s
 
-    dt = pd.to_datetime(s_numeric, unit="D", origin="1899-12-30", errors="coerce")
-    # For entries that didn't convert (NaT), try parsing as normal datetime/string
-    mask_nat = dt.isna()
-    if mask_nat.any():
+    # Try numeric first
+    s_num = pd.to_numeric(s, errors="coerce")
+    dt = pd.to_datetime(s_num, unit="D", origin="1899-12-30", errors="coerce")
+
+    # Fill NaT by attempting standard parse
+    need = dt.isna()
+    if need.any():
         dt2 = pd.to_datetime(s.astype(str), errors="coerce")
-        dt.loc[mask_nat] = dt2.loc[mask_nat]
-    # Return normalized to date (no time)
+        dt.loc[need] = dt2.loc[need]
+
     return pd.to_datetime(dt.dt.date, errors="coerce")
 
-def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) -> pd.DataFrame:
-    """Standardize RM extract columns and add metadata."""
-    # Trim whitespace in headers
-    df.columns = [c.strip() for c in df.columns]
-
-    # We only keep/report these columns (if present)
-    missing = [c for c in REPORT_COLUMNS if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"RM Extract appears to be missing columns required for reporting: {missing}"
-        )
-
-    out = df.copy()
-
-    # Create a consistent snapshot date:
-    # Prefer 'Report_Date' if present; otherwise fallback to 'Month/Year'
-    snap = None
-    if "Report_Date" in out.columns:
-        snap = excel_serial_to_datetime(out["Report_Date"])
-    if snap is None or snap.isna().all():
-        snap = excel_serial_to_datetime(out["Month/Year"])
-
-    out["snapshot_date"] = snap
-
-    # Coerce numeric for Blocked Stock Qty
-    out["Blocked Stock Qty"] = pd.to_numeric(out["Blocked Stock Qty"], errors="coerce").fillna(0.0)
-
-    # Add metadata for versioning
-    out["source_file"] = src_name
-    out["version_tag"] = version_tag
-    out["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
-
-    return out
-
 def detect_file_kind(file_name: str, df: pd.DataFrame) -> str:
-    """
-    Heuristics to decide which table the file belongs to.
-    - RM Extract: must contain 'Blocked Stock Qty' and 'Material ID' etc.
-    - Otherwise PO history.
-    """
     cols = set(df.columns)
     if {"Blocked Stock Qty", "Material ID", "Plant", "Plant ID"}.issubset(cols):
         return "RM"
-    # Fallback by filename hints
     name_lower = file_name.lower()
     if "rm extract" in name_lower or "data by month" in name_lower:
         return "RM"
     return "PO"
 
+def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [c.strip() for c in df.columns]
+
+    missing = [c for c in REPORT_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"RM Extract is missing required columns: {missing}")
+
+    # Compute snapshot_date (prefer Report_Date, else Month/Year)
+    if "Report_Date" in df.columns:
+        snap = excel_serial_to_datetime(df["Report_Date"])
+    else:
+        snap = None
+    if snap is None or snap.isna().all():
+        snap = excel_serial_to_datetime(df["Month/Year"])
+    df["snapshot_date"] = snap
+
+    df["Blocked Stock Qty"] = pd.to_numeric(df["Blocked Stock Qty"], errors="coerce").fillna(0.0)
+    df["source_file"] = src_name
+    df["version_tag"] = version_tag
+    df["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+    return df
+
 def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
-    """
-    Load uploaded Excel files into SQLite via pandas.to_sql
-    Returns status messages.
-    """
-    engine = get_engine()
-    ensure_tables(engine)
     msgs = []
+    conn = get_conn()
+    ensure_tables(conn)
 
     for f in files:
         fname = getattr(f, "name", "uploaded.xlsx")
         try:
-            # Read all sheets—most relevant data is usually in the first sheet named "Data"
-            # but reading all increases resilience to format changes.
             xls = pd.ExcelFile(f, engine="openpyxl")
             frames = []
             for sh in xls.sheet_names:
@@ -152,54 +118,53 @@ def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
                     tmp["__sheet__"] = sh
                     frames.append(tmp)
             if not frames:
-                msgs.append(f"⚠️ {fname}: no data found in workbook.")
+                msgs.append(f"⚠️ {fname}: no data found.")
                 continue
-            df_all = pd.concat(frames, ignore_index=True)
 
+            df_all = pd.concat(frames, ignore_index=True)
             kind = detect_file_kind(fname, df_all)
+
             if kind == "RM":
-                # Normalize for reporting; but we still store the raw as well
                 df_norm = normalize_rm_dataframe(df_all, fname, version_tag)
 
-                # Upsert/append into rm table
-                with engine.begin() as con:
-                    df_norm.to_sql(TABLE_RM, con, if_exists="append", index=False)
-                    con.exec_driver_sql(
-                        f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (TABLE_RM, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(df_norm.shape[0]))
-                    )
-                msgs.append(f"✅ {fname}: loaded {df_norm.shape[0]:,} RM rows into '{TABLE_RM}' (version '{version_tag}').")
-
+                # append to RM table
+                df_norm.to_sql(TABLE_RM, conn, if_exists="append", index=False)
+                conn.execute(
+                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) VALUES (?, ?, ?, ?, ?)",
+                    (TABLE_RM, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(df_norm.shape[0]))
+                )
+                conn.commit()
+                msgs.append(f"✅ {fname}: loaded {df_norm.shape[0]:,} rows into '{TABLE_RM}' (version '{version_tag}').")
             else:
-                # PO history—store raw with metadata
                 df_po = df_all.copy()
                 df_po["source_file"] = fname
                 df_po["version_tag"] = version_tag
                 df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
-                with engine.begin() as con:
-                    df_po.to_sql(TABLE_PO, con, if_exists="append", index=False)
-                    con.exec_driver_sql(
-                        f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
-                        "VALUES (?, ?, ?, ?, ?)",
-                        (TABLE_PO, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(df_po.shape[0]))
-                    )
-                msgs.append(f"✅ {fname}: loaded {df_po.shape[0]:,} PO rows into '{TABLE_PO}' (version '{version_tag}').")
+                df_po.to_sql(TABLE_PO, conn, if_exists="append", index=False)
+                conn.execute(
+                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) VALUES (?, ?, ?, ?, ?)",
+                    (TABLE_PO, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(df_po.shape[0]))
+                )
+                conn.commit()
+                msgs.append(f"✅ {fname}: loaded {df_po.shape[0]:,} rows into '{TABLE_PO}' (version '{version_tag}').")
 
         except Exception as e:
-            msgs.append(f"❌ {fname}: ingestion failed — {e}")
+            msgs.append(f"❌ {fname}: ingestion failed — {e!s}")
 
     return msgs
 
 @st.cache_data(show_spinner=False)
-def get_versions(engine: sa.Engine) -> List[str]:
+def get_versions() -> List[str]:
     try:
-        return pd.read_sql(f"SELECT DISTINCT version_tag FROM {TABLE_LOG} ORDER BY uploaded_at_utc DESC", engine)["version_tag"].tolist()
+        conn = get_conn()
+        df = pd.read_sql(f"SELECT DISTINCT version_tag FROM {TABLE_LOG} ORDER BY uploaded_at_utc DESC", conn)
+        return df["version_tag"].tolist()
     except Exception:
         return []
 
 @st.cache_data(show_spinner=False)
-def load_rm_for_report(engine: sa.Engine, versions: Optional[List[str]] = None) -> pd.DataFrame:
+def load_rm_for_report(versions: Optional[List[str]] = None) -> pd.DataFrame:
+    conn = get_conn()
     base_sql = f"""
         SELECT
             [Month/Year], [Report_Date], [Plant], [Plant ID], [Material ID], [Material Desc],
@@ -207,14 +172,13 @@ def load_rm_for_report(engine: sa.Engine, versions: Optional[List[str]] = None) 
         FROM {TABLE_RM}
         WHERE snapshot_date IS NOT NULL
     """
-    params = {}
     if versions:
-        qmarks = ",".join([f":v{i}" for i in range(len(versions))])
-        base_sql += f" AND version_tag IN ({qmarks})"
-        params = {f"v{i}": v for i, v in enumerate(versions)}
+        placeholders = ",".join(["?"] * len(versions))
+        sql = base_sql + f" AND version_tag IN ({placeholders})"
+        df = pd.read_sql(sql, conn, params=versions, parse_dates=["snapshot_date"])
+    else:
+        df = pd.read_sql(base_sql, conn, parse_dates=["snapshot_date"])
 
-    df = pd.read_sql(base_sql, engine, params=params, parse_dates=["snapshot_date"])
-    # Clean strings
     for c in ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
@@ -223,7 +187,6 @@ def load_rm_for_report(engine: sa.Engine, versions: Optional[List[str]] = None) 
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.markdown("### 🔎 Filters")
 
-    # Build filters from current dataset
     plant = st.sidebar.multiselect("Plant", sorted(df["Plant"].dropna().unique().tolist()))
     plant_id = st.sidebar.multiselect("Plant ID", sorted(df["Plant ID"].dropna().unique().tolist()))
     material_id = st.sidebar.multiselect("Material ID", sorted(df["Material ID"].dropna().unique().tolist()))
@@ -257,19 +220,18 @@ def render_time_series(df: pd.DataFrame):
           .sort_values("snapshot_date")
     )
 
-    # Allow date range restriction
+    # Date range slider
     min_d, max_d = ts["snapshot_date"].min(), ts["snapshot_date"].max()
     dr = st.slider(
         "Snapshot date range",
         min_value=min_d.to_pydatetime(),
         max_value=max_d.to_pydatetime(),
         value=(min_d.to_pydatetime(), max_d.to_pydatetime()),
-        format="YYYY-MM-DD",
-        key="date_slider"
+        format="YYYY-MM-DD"
     )
     ts = ts[(ts["snapshot_date"] >= pd.to_datetime(dr[0])) & (ts["snapshot_date"] <= pd.to_datetime(dr[1]))]
 
-    # Plotly (nice tooltips on Streamlit)
+    # Use Plotly (works well on Streamlit Cloud)
     import plotly.express as px
     fig = px.line(
         ts,
@@ -282,7 +244,6 @@ def render_time_series(df: pd.DataFrame):
     fig.update_layout(hovermode="x unified", height=420)
     st.plotly_chart(fig, use_container_width=True)
 
-    # Detail table
     with st.expander("Show aggregated data"):
         st.dataframe(ts, use_container_width=True)
         st.download_button(
@@ -293,18 +254,14 @@ def render_time_series(df: pd.DataFrame):
         )
 
 def render_cut_by_dimensions(df: pd.DataFrame):
-    st.markdown("#### 🔬 Optional: Cut by dimension (top contributors)")
+    st.markdown("#### 🔬 Cut by dimension (top contributors)")
     dim = st.selectbox(
         "Group by",
         ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"],
         index=0
     )
     top_n = st.slider("Top N", 3, 25, 10)
-    grouped = (
-        df.groupby([dim, "snapshot_date"], as_index=False)["Blocked Stock Qty"]
-          .sum()
-    )
-    # Pick top N by latest snapshot
+    grouped = df.groupby([dim, "snapshot_date"], as_index=False)["Blocked Stock Qty"].sum()
     latest = grouped["snapshot_date"].max()
     top_dim = (
         grouped[grouped["snapshot_date"] == latest]
@@ -315,7 +272,7 @@ def render_cut_by_dimensions(df: pd.DataFrame):
     import plotly.express as px
     fig = px.line(
         view, x="snapshot_date", y="Blocked Stock Qty", color=dim,
-        title=f"Blocked Stock Qty by {dim} (Top {top_n} at latest snapshot)",
+        title=f"Blocked Stock Qty by {dim} (Top {top_n} @ latest snapshot)",
         labels={"snapshot_date": "Snapshot Date", "Blocked Stock Qty": "Blocked Stock Qty", dim: dim},
     )
     fig.update_layout(hovermode="x unified", height=420, legend=dict(orientation="h", y=-0.2))
@@ -324,70 +281,67 @@ def render_cut_by_dimensions(df: pd.DataFrame):
     with st.expander("Show grouped data"):
         st.dataframe(view, use_container_width=True)
 
-# -------------------------------------
+# ---------------------------
 # UI
-# -------------------------------------
+# ---------------------------
 st.title("📦 Blocked Stock Reporting (RM) + Ingestion")
-st.caption("Drag-and-drop new versions of your files, store them in SQLite, and explore Blocked Stock Qty over time.")
+st.caption("Upload Excel files, store them in SQLite, and explore Blocked Stock Qty over time.")
 
-engine = get_engine()
-ensure_tables(engine)
-
+# Sidebar: ingestion
 with st.sidebar:
     st.markdown("### 📥 Ingest data")
     version_tag = st.text_input(
-        "Version tag (e.g., 2026-02 monthly, or sprint name)",
+        "Version tag (e.g., 2026-02)",
         value=datetime.utcnow().strftime("%Y-%m-%d")
     )
     uploads = st.file_uploader(
-        "Upload Excel files (.xlsx)",
+        "Upload Excel (.xlsx)",
         type=["xlsx"],
         accept_multiple_files=True,
-        help="Upload any combination of 'PO_history.xlsx' and 'RM Extract - Data by Month.xlsx'. Each upload stores a new version."
+        help="Upload 'RM Extract - Data by Month.xlsx' (and optionally 'PO_history.xlsx')."
     )
     if st.button("Load files into database", type="primary", use_container_width=True, disabled=(not uploads)):
-        msgs = load_uploaded_files(uploads, version_tag=version_tag)
-        for m in msgs:
-            st.toast(m, icon="✅" if m.startswith("✅") else "⚠️" if m.startswith("⚠️") else "❌")
-        # Clear caches so filters and data refresh
-        get_versions.clear()
-        load_rm_for_report.clear()
+        try:
+            msgs = load_uploaded_files(uploads, version_tag=version_tag)
+            for m in msgs:
+                st.toast(m, icon="✅" if m.startswith("✅") else "⚠️" if m.startswith("⚠️") else "❌")
+            get_versions.clear()
+            load_rm_for_report.clear()
+        except Exception as e:
+            st.error(f"Ingestion failed: {e}")
 
-st.markdown("### 🗂️ Data source versions")
-avail_versions = get_versions(engine)
-if not avail_versions:
-    st.info("No data in the database yet. Upload at least the **RM Extract** file to build the Blocked Stock report.")
+# Versions available
+versions = get_versions()
+if not versions:
+    st.info("No data yet. Upload the **RM Extract** to start.")
     st.stop()
 
-pick_versions = st.multiselect(
-    "Select version(s) to include in the report",
-    options=avail_versions,
-    default=avail_versions[:1]  # default to most recent one
-)
+pick_versions = st.multiselect("Select version(s) for the report", options=versions, default=versions[:1])
 
-df_rm = load_rm_for_report(engine, versions=pick_versions)
+try:
+    df_rm = load_rm_for_report(pick_versions)
+except Exception as e:
+    st.error(f"Failed to load RM data for reporting: {e}")
+    st.stop()
+
 if df_rm.empty:
-    st.warning("No RM data found for the selected version(s).")
+    st.warning("No RM data found for selected version(s).")
     st.stop()
 
 # Filters
 df_filtered = apply_filters(df_rm)
 
 # KPIs
-col1, col2, col3 = st.columns(3)
-with col1:
-    st.metric("Rows (after filters)", f"{len(df_filtered):,}")
-with col2:
-    st.metric("Snapshots", df_filtered["snapshot_date"].nunique())
-with col3:
-    st.metric("Blocked Stock Total", f"{df_filtered['Blocked Stock Qty'].sum():,.2f}")
+c1, c2, c3 = st.columns(3)
+c1.metric("Rows (after filters)", f"{len(df_filtered):,}")
+c2.metric("Snapshots", df_filtered["snapshot_date"].nunique())
+c3.metric("Blocked Stock Total", f"{df_filtered['Blocked Stock Qty'].sum():,.2f}")
 
 # Charts
 render_time_series(df_filtered)
 render_cut_by_dimensions(df_filtered)
 
-# Raw view (optional)
-with st.expander("Show filtered rows (raw)"):
+with st.expander("Show filtered rows"):
     st.dataframe(df_filtered, use_container_width=True, height=400)
     st.download_button(
         "Download filtered CSV",
@@ -399,10 +353,7 @@ with st.expander("Show filtered rows (raw)"):
 st.markdown("---")
 st.markdown(
     "ℹ️ **Notes**\n"
-    "- The app stores each upload with a **version tag** and **timestamp**. You can include multiple versions in the report.\n"
-    "- Dates are parsed from `Report_Date` (preferred) or `Month/Year` if needed. Both can be Excel serials.\n"
-    "- `PO_history.xlsx` is ingested and logged for completeness, though the **Blocked Stock** report uses the **RM Extract** dataset."
+    "- Each upload is stored with your **version tag** and a **timestamp**.\n"
+    "- Dates are parsed from `Report_Date` (preferred) or `Month/Year`.\n"
+    "- `PO_history.xlsx` is ingested for completeness; the chart uses the RM dataset."
 )
-
-
-
