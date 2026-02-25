@@ -23,7 +23,7 @@ st.set_page_config(page_title="Blocked Stock Report", page_icon="📦", layout="
 # Settings
 # ---------------------------
 DB_PATH = os.environ.get("APP_DB_PATH", "data.db")
-UPLOADS_DIR = os.environ.get("APP_UPLOADS_DIR", "/")   # default folder for auto-ingest
+UPLOADS_DIR = os.environ.get("APP_UPLOADS_DIR", "")   # default folder for auto-ingest
 
 TABLE_RM = "rm_inventory_raw"       # normalized for reporting
 TABLE_PO = "po_history_raw"         # raw storage (logged), not used for the chart
