@@ -1,5 +1,5 @@
 # streamlit_app.py
-# Streamlit app: Latest-only ingestion with hard table drops to ensure the correct schema,
+# Streamlit app: Latest-only ingestion with auto-load on startup (if DB is empty),
 # monthly inventory reporting from "Month/Year", optional DuckDB+Parquet fast path.
 # Author: Emmanuel + Copilot
 
@@ -120,7 +120,7 @@ def ensure_indexes(conn: sqlite3.Connection):
     conn.commit()
 
 def purge_all_previous_records(conn: sqlite3.Connection):
-    """Hard reset: drop tables + remove Parquet so the new schema is guaranteed to include month_date."""
+    """Hard reset: drop tables + remove Parquet so the new schema includes month_date and only latest data remains."""
     with st.spinner("🧹 Purging previous tables and snapshots …"):
         for tbl in (TABLE_RM, TABLE_PO, TABLE_LOG):
             try:
@@ -288,7 +288,7 @@ def write_parquet_snapshot(df_norm: pd.DataFrame) -> str:
 # -------------------------------------------
 # Ingestion (LATEST ONLY, hard drop)
 # -------------------------------------------
-def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folder_scan: bool = False) -> List[str]:
+def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str) -> List[str]:
     """
     Ingest a batch of files:
       - DROP TABLES + remove Parquet (latest-only; guarantees schema freshness)
@@ -315,9 +315,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
             kind = detect_file_kind(fname, df_all)
 
             if kind == "RM":
-                # For latest-only, version tag is informational only
                 vtag = version_tag_for_uploads
-
                 df_norm = normalize_rm_dataframe(df_all, fname, vtag)
                 rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
 
@@ -325,7 +323,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
                 loaded_any_rm = True
                 latest_rm_df = df_norm if latest_rm_df is None else pd.concat([latest_rm_df, df_norm], ignore_index=True)
 
-                # Log entry (for traceability, even though log table is dropped each batch)
+                # Log entry (for traceability; note: log table is recreated each batch)
                 conn.execute(
                     f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
                     f"VALUES (?, ?, ?, ?, ?)",
@@ -379,7 +377,7 @@ def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folde
 
 def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
     """Wrapper for uploader ingestion (latest only)."""
-    return ingest_batch(files, version_tag_for_uploads=version_tag, is_folder_scan=False)
+    return ingest_batch(files, version_tag_for_uploads=version_tag)
 
 def scan_script_folder_and_ingest() -> List[str]:
     """
@@ -407,7 +405,7 @@ def scan_script_folder_and_ingest() -> List[str]:
             b.name = os.path.basename(path)
             files.append(b)
 
-    return ingest_batch(files, version_tag_for_uploads=datetime.utcnow().strftime("%Y-%m-%d"), is_folder_scan=True)
+    return ingest_batch(files, version_tag_for_uploads=datetime.utcnow().strftime("%Y-%m-%d"))
 
 # -------------------------------------------
 # Data access for reporting
@@ -615,7 +613,7 @@ def render_cut_by_dimensions(df: pd.DataFrame, extend_series: bool):
         st.dataframe(view, use_container_width=True)
 
 # -------------------------------------------
-# UI
+# UI – ingestion controls
 # -------------------------------------------
 st.title("📦 Blocked Stock Reporting — Monthly (Latest Only)")
 st.caption("Each load **drops** the previous data and snapshots; only the newest dataset is kept.")
@@ -647,7 +645,6 @@ with st.sidebar:
 
     with col2:
         if st.button("Scan & load (script folder, overwrite previous)", use_container_width=True):
-            # Collect .xlsx in script folder and load
             xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
             if not xlsx_paths:
                 st.warning(f"No .xlsx files found next to the script in {SCRIPT_DIR}.")
@@ -667,7 +664,36 @@ extend_series = st.checkbox(
     help="Reindexes the monthly series through the current month and forward‑fills."
 )
 
-# Load latest-only RM data
+# ----------------------------------------------------------
+# AUTO-LOAD ON STARTUP WHEN DB IS EMPTY (recommended)
+# ----------------------------------------------------------
+# If no RM table or it's empty, and .xlsx files exist next to the script,
+# auto-trigger the folder ingestion ONCE.
+initial_check_conn = get_conn()
+try:
+    existing = pd.read_sql(
+        f"SELECT COUNT(*) AS n FROM {TABLE_RM}",
+        initial_check_conn
+    )
+    rm_count = existing["n"].iloc[0]
+except Exception:
+    rm_count = 0  # table does not exist yet
+
+# Auto-trigger only if database is empty
+if rm_count == 0:
+    xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
+    if xlsx_paths:
+        st.info("📂 No data in DB — auto-loading Excel files from script folder...")
+        msgs = scan_script_folder_and_ingest()
+        for m in msgs:
+            st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
+        # Clear caches so freshly loaded data is visible
+        load_rm_for_report_sqlite.clear()
+        load_rm_for_report_duckdb.clear()
+
+# -------------------------------------------
+# Load latest-only RM data for reporting
+# -------------------------------------------
 try:
     df_rm = load_rm_for_report()
 except Exception as e:
@@ -675,7 +701,7 @@ except Exception as e:
     st.stop()
 
 if df_rm.empty:
-    st.info("No data available. Load a file set via the sidebar; previous contents are dropped each time.")
+    st.info("No data available. Ensure `.xlsx` files are next to the script or upload via the sidebar. Previous contents are dropped each time.")
     st.stop()
 
 # Filters
@@ -703,9 +729,11 @@ with st.expander("Show filtered rows"):
 st.markdown("---")
 st.markdown(
     "ℹ️ **Latest-only policy**\n"
+    "- On first run (or when the DB is empty), the app auto-loads any `.xlsx` files in the script folder.\n"
     "- Each ingestion **drops** all previous rows and snapshot files; only the newest dataset remains.\n"
     "- Time axis is derived from **`Month/Year`** and normalized to the **first day of each month**.\n"
     "- Optimized mode writes/reads a single `rm_latest.parquet` snapshot for speed; otherwise the app reads from SQLite."
 )
+
 
 
