@@ -1,6 +1,7 @@
 # streamlit_app.py
 # Streamlit app: Latest-only ingestion with auto-load on startup (if DB is empty),
-# monthly inventory reporting from "Month/Year", optional DuckDB+Parquet fast path.
+# monthly inventory reporting from "Month/Year", optional DuckDB+Parquet fast path,
+# and a PO Analysis section (Top 30 by quantity + average/std dev lead-time).
 # Author: Emmanuel + Copilot
 
 import glob
@@ -9,7 +10,7 @@ import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -408,7 +409,7 @@ def scan_script_folder_and_ingest() -> List[str]:
     return ingest_batch(files, version_tag_for_uploads=datetime.utcnow().strftime("%Y-%m-%d"))
 
 # -------------------------------------------
-# Data access for reporting
+# Data access for reporting (RM)
 # -------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_rm_for_report_sqlite() -> pd.DataFrame:
@@ -461,7 +462,132 @@ def load_rm_for_report() -> pd.DataFrame:
     return load_rm_for_report_duckdb() if (opt_mode and HAVE_DUCKDB) else load_rm_for_report_sqlite()
 
 # -------------------------------------------
-# Filtering & Charts
+# PO Analysis helpers
+# -------------------------------------------
+def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    try:
+        cur = conn.execute(f'PRAGMA table_info("{table}")')
+        cols = [r[1] for r in cur.fetchall()]
+        return cols
+    except Exception:
+        return []
+
+def _find_col(cols: Sequence[str], candidates: Sequence[str]) -> Optional[str]:
+    cols_lc = {c.lower(): c for c in cols}
+    for cand in candidates:
+        key = cand.lower()
+        if key in cols_lc:
+            return cols_lc[key]
+    # try relaxed match (remove spaces / underscores)
+    relaxed = {c.lower().replace(" ", "").replace("_", ""): c for c in cols}
+    for cand in candidates:
+        key = cand.lower().replace(" ", "").replace("_", "")
+        if key in relaxed:
+            return relaxed[key]
+    return None
+
+def load_po_material_choices() -> Tuple[List[str], dict]:
+    """Return a sorted list of material IDs and a mapping of canonical names actually present."""
+    conn = get_conn()
+    cols = get_table_columns(conn, TABLE_PO)
+    if not cols:
+        return [], {}
+
+    material_col = _find_col(cols, ["Material ID", "Material"])
+    if material_col is None:
+        return [], {}
+
+    # fetch distinct materials (limit to keep UI snappy if huge)
+    df = pd.read_sql(f'SELECT DISTINCT "{material_col}" AS material FROM {TABLE_PO} WHERE "{material_col}" IS NOT NULL LIMIT 20000', conn)
+    materials = sorted(df["material"].astype(str).str.strip().unique().tolist())
+
+    # build a mapping of useful columns we may later extract
+    mapping = {
+        "material": material_col,
+        "po_number": _find_col(cols, ["PO Number", "PurDoc", "PO", "EBELN"]),
+        "creation_date": _find_col(cols, ["PO Creation Date", "Created On", "Doc. Date"]),
+        "gr_date": _find_col(cols, ["Goods Receipt Date", "Actual GR Date", "GR Date"]),
+        "qty": _find_col(cols, ["PO qty", "PO Qty", "Order Qty", "Quantity"]),
+        "vendor": _find_col(cols, ["Vendor", "Supplier"]),
+        "plant": _find_col(cols, ["Plant", "Plnt", "Plant ID"]),
+        "short_text": _find_col(cols, ["Short Text", "Material Desc", "Description"]),
+        "currency": _find_col(cols, ["Crcy", "Currency"]),
+        "net_price": _find_col(cols, ["Net Price", "Price"]),
+    }
+    return materials, mapping
+
+def _parse_date_series(s: pd.Series) -> pd.Series:
+    # handle either Excel serials or text dates
+    return excel_serial_to_datetime(s)
+
+def load_po_for_material(material_id: str, mapping: dict) -> pd.DataFrame:
+    """Load PO rows for a given material with essential columns; compute lead-time."""
+    conn = get_conn()
+    mcol = mapping.get("material")
+    if not mcol:
+        return pd.DataFrame()
+
+    # Build the SELECT only with available columns
+    select_cols = [c for c in [
+        mapping.get("po_number") or "rowid",
+        mcol,
+        mapping.get("creation_date"),
+        mapping.get("gr_date"),
+        mapping.get("qty"),
+        mapping.get("vendor"),
+        mapping.get("plant"),
+        mapping.get("short_text"),
+        mapping.get("currency"),
+        mapping.get("net_price"),
+    ] if c is not None]
+
+    select_sql_cols = ", ".join([f'"{c}"' if c != "rowid" else "rowid" for c in select_cols])
+    sql = f'SELECT {select_sql_cols} FROM {TABLE_PO} WHERE "{mcol}" = ?'
+    df = pd.read_sql(sql, conn, params=[material_id])
+
+    # Rename to canonical names where possible for UI clarity
+    ren = {}
+    if mapping.get("po_number"): ren[mapping["po_number"]] = "PO Number"
+    ren[mcol] = "Material ID"
+    if mapping.get("creation_date"): ren[mapping["creation_date"]] = "PO Creation Date"
+    if mapping.get("gr_date"): ren[mapping["gr_date"]] = "Goods Receipt Date"
+    if mapping.get("qty"): ren[mapping["qty"]] = "PO Qty"
+    if mapping.get("vendor"): ren[mapping["vendor"]] = "Vendor"
+    if mapping.get("plant"): ren[mapping["plant"]] = "Plant"
+    if mapping.get("short_text"): ren[mapping["short_text"]] = "Short Text"
+    if mapping.get("currency"): ren[mapping["currency"]] = "Currency"
+    if mapping.get("net_price"): ren[mapping["net_price"]] = "Net Price"
+    df = df.rename(columns=ren)
+
+    # Parse dates & compute lead-time (days)
+    if "PO Creation Date" in df.columns:
+        df["PO Creation Date"] = _parse_date_series(df["PO Creation Date"])
+    else:
+        df["PO Creation Date"] = pd.NaT
+
+    if "Goods Receipt Date" in df.columns:
+        df["Goods Receipt Date"] = _parse_date_series(df["Goods Receipt Date"])
+    else:
+        df["Goods Receipt Date"] = pd.NaT
+
+    df["lead_time_days"] = (df["Goods Receipt Date"] - df["PO Creation Date"]).dt.days
+
+    # Qty numeric
+    if "PO Qty" in df.columns:
+        df["PO Qty"] = pd.to_numeric(df["PO Qty"], errors="coerce")
+    else:
+        df["PO Qty"] = np.nan
+
+    # Clean up PO Number if missing
+    if "PO Number" not in df.columns:
+        df["PO Number"] = df.index.astype(str)
+
+    # Drop rows without dates or qty for the lead-time analysis
+    df = df.dropna(subset=["PO Creation Date", "Goods Receipt Date", "lead_time_days", "PO Qty"])
+    return df
+
+# -------------------------------------------
+# Filtering & Charts (RM)
 # -------------------------------------------
 def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
     st.sidebar.markdown("### 🔎 Filters")
@@ -727,12 +853,76 @@ with st.expander("Show filtered rows"):
     )
 
 st.markdown("---")
+
+# ===========================================
+# 🆕 PO ANALYSIS SECTION
+# ===========================================
+st.header("📑 PO Analysis (Top 30 by Quantity)")
+
+materials, po_mapping = load_po_material_choices()
+if not materials:
+    st.info("PO data not available yet (or missing required columns like Material / Dates / Quantity). Load PO history and try again.")
+else:
+    colA, colB = st.columns([2, 1])
+    with colA:
+        mat_choice = st.selectbox("Select Material ID (from PO history)", options=materials, index=0)
+    with colB:
+        go_btn = st.button("Show PO analysis", type="primary", use_container_width=True)
+
+    if go_btn:
+        df_po = load_po_for_material(mat_choice, po_mapping)
+        if df_po.empty:
+            st.warning("No valid PO rows found for this material with usable dates and quantity.")
+        else:
+            # Top 30 by PO Qty
+            top = df_po.sort_values("PO Qty", ascending=False).head(30).copy()
+
+            # KPIs
+            avg_lt = float(np.nanmean(top["lead_time_days"])) if len(top) else np.nan
+            std_lt = float(np.nanstd(top["lead_time_days"], ddof=1)) if len(top) > 1 else np.nan
+
+            k1, k2, k3 = st.columns(3)
+            with k1:
+                st.metric("PO lines (top set)", f"{len(top):,}")
+            with k2:
+                st.metric("Avg Lead‑Time (days)", f"{avg_lt:,.1f}" if np.isfinite(avg_lt) else "—")
+            with k3:
+                st.metric("Std Dev Lead‑Time", f"{std_lt:,.1f}" if np.isfinite(std_lt) else "—")
+
+            # Table view
+            show_cols = [c for c in [
+                "PO Number", "Material ID", "PO Creation Date", "Goods Receipt Date",
+                "lead_time_days", "PO Qty", "Vendor", "Plant", "Short Text", "Currency", "Net Price"
+            ] if c in top.columns]
+            st.dataframe(top[show_cols], use_container_width=True, height=420)
+
+            st.download_button(
+                "Download Top 30 PO lines (CSV)",
+                top[show_cols].to_csv(index=False).encode("utf-8"),
+                file_name=f"po_top30_{mat_choice}.csv",
+                mime="text/csv"
+            )
+
+            # Chart: lead-time vs PO (sorted by quantity)
+            import plotly.express as px
+            top_plot = top.sort_values(["PO Qty", "lead_time_days"], ascending=[False, True]).copy()
+            top_plot["PO Number"] = top_plot["PO Number"].astype(str)
+            fig = px.bar(
+                top_plot,
+                x="PO Number",
+                y="lead_time_days",
+                hover_data=show_cols,
+                title=f"Lead‑Time (days) by PO — Top 30 by Quantity for {mat_choice}",
+                labels={"lead_time_days": "Lead‑Time (days)", "PO Number": "PO Number"},
+            )
+            fig.update_layout(xaxis_tickangle=-45, height=460)
+            st.plotly_chart(fig, use_container_width=True)
+
 st.markdown(
-    "ℹ️ **Latest-only policy**\n"
-    "- On first run (or when the DB is empty), the app auto-loads any `.xlsx` files in the script folder.\n"
-    "- Each ingestion **drops** all previous rows and snapshot files; only the newest dataset remains.\n"
-    "- Time axis is derived from **`Month/Year`** and normalized to the **first day of each month**.\n"
-    "- Optimized mode writes/reads a single `rm_latest.parquet` snapshot for speed; otherwise the app reads from SQLite."
+    "ℹ️ **Notes**\n"
+    "- Lead‑time is computed as **Goods Receipt Date − PO Creation Date** (in days).\n"
+    "- Column name variants are supported (e.g., *Created On* / *Actual GR Date* / *PO qty*).\n"
+    "- The PO view uses the **latest-only dataset** (reloaded on each ingestion)."
 )
 
 
