@@ -1,6 +1,7 @@
 # streamlit_app.py
-# Streamlit app: scan the script folder and/or drag&drop Excel files,
-# load into SQLite (with dedup + progress bars), and report Blocked Stock Qty.
+# Streamlit app: keep ONLY the latest version.
+# On each load action, purge all previous DB rows and Parquet snapshots,
+# then ingest the new files, build MONTHLY inventory evolution from "Month/Year".
 # Author: Emmanuel + Copilot
 
 import glob
@@ -16,18 +17,20 @@ import pandas as pd
 import streamlit as st
 
 # -------------------------------------------
-# Page config
+# Page & layout
 # -------------------------------------------
-st.set_page_config(page_title="Blocked Stock Report", page_icon="📦", layout="wide")
+st.set_page_config(page_title="Blocked Stock Report (Monthly) – Latest Only", page_icon="📦", layout="wide")
 
 # -------------------------------------------
 # Paths / Settings
 # -------------------------------------------
-SCRIPT_DIR = Path(__file__).parent.resolve()                 # we scan THIS folder
+SCRIPT_DIR = Path(__file__).parent.resolve()  # scan THIS folder
 DB_PATH = os.environ.get("APP_DB_PATH", str(SCRIPT_DIR / "data.db"))
+PARQUET_DIR = SCRIPT_DIR / "parquet"
+PARQUET_DIR.mkdir(exist_ok=True)
 
-TABLE_RM = "rm_inventory_raw"       # normalized RM data for reporting
-TABLE_PO = "po_history_raw"         # raw PO history (stored for completeness)
+TABLE_RM = "rm_inventory_raw"       # normalized RM data (uses 'month_date')
+TABLE_PO = "po_history_raw"         # raw PO history
 TABLE_LOG = "ingestion_log"
 
 REPORT_COLUMNS = [
@@ -48,6 +51,28 @@ except Exception as e:
     )
     st.stop()
 
+# Optional optimized mode: Parquet + DuckDB (fast analytics)
+opt_mode = st.sidebar.toggle(
+    "⚡ Optimized mode (Parquet + DuckDB)",
+    value=True,
+    help="Reads per-load Parquet snapshot(s) with DuckDB for faster aggregations. "
+         "If unavailable, the app falls back to SQLite."
+)
+HAVE_DUCKDB = True
+if opt_mode:
+    try:
+        import duckdb  # noqa: F401
+        import pyarrow as pa  # noqa: F401
+        import pyarrow.parquet as pq  # noqa: F401
+    except Exception as e:
+        st.warning(
+            "Optimized mode is ON but `duckdb`/`pyarrow` not available; falling back to SQLite.\n\n"
+            f"Details: `{e}`"
+        )
+        HAVE_DUCKDB = False
+else:
+    HAVE_DUCKDB = False
+
 # -------------------------------------------
 # SQLite helpers
 # -------------------------------------------
@@ -57,7 +82,7 @@ def get_conn() -> sqlite3.Connection:
         detect_types=sqlite3.PARSE_DECLTYPES | sqlite3.PARSE_COLNAMES,
         check_same_thread=False,
     )
-    # Pragmas to improve read/write performance
+    # Pragmas for perf
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA temp_store=MEMORY;")
@@ -79,15 +104,14 @@ def ensure_tables(conn: sqlite3.Connection):
     conn.commit()
 
 def ensure_indexes(conn: sqlite3.Connection):
-    # Indexes to speed up WHERE filters and date slicing
+    # Indexes to speed WHERE filters and date slicing
     idx_sql = [
-        f'CREATE INDEX IF NOT EXISTS idx_rm_snapshot      ON {TABLE_RM}(snapshot_date);',
-        f'CREATE INDEX IF NOT EXISTS idx_rm_plant         ON {TABLE_RM}("Plant");',
-        f'CREATE INDEX IF NOT EXISTS idx_rm_plant_id      ON {TABLE_RM}("Plant ID");',
-        f'CREATE INDEX IF NOT EXISTS idx_rm_material_id   ON {TABLE_RM}("Material ID");',
+        f'CREATE INDEX IF NOT EXISTS idx_rm_month        ON {TABLE_RM}(month_date);',
+        f'CREATE INDEX IF NOT EXISTS idx_rm_plant        ON {TABLE_RM}("Plant");',
+        f'CREATE INDEX IF NOT EXISTS idx_rm_plant_id     ON {TABLE_RM}("Plant ID");',
+        f'CREATE INDEX IF NOT EXISTS idx_rm_material_id  ON {TABLE_RM}("Material ID");',
         f'CREATE INDEX IF NOT EXISTS idx_rm_material_desc ON {TABLE_RM}("Material Desc");',
-        f'CREATE INDEX IF NOT EXISTS idx_rm_mg_desc       ON {TABLE_RM}("Material Group Desc");',
-        f'CREATE INDEX IF NOT EXISTS idx_rm_version       ON {TABLE_RM}(version_tag);',
+        f'CREATE INDEX IF NOT EXISTS idx_rm_mg_desc      ON {TABLE_RM}("Material Group Desc");',
     ]
     for sql in idx_sql:
         try:
@@ -95,6 +119,25 @@ def ensure_indexes(conn: sqlite3.Connection):
         except Exception:
             pass
     conn.commit()
+
+def purge_all_previous_records(conn: sqlite3.Connection):
+    """Delete ALL existing data & snapshots so only the latest load remains."""
+    with st.spinner("🧹 Purging previous records and snapshots …"):
+        # Drop rows from data tables and log
+        for tbl in (TABLE_RM, TABLE_PO, TABLE_LOG):
+            try:
+                conn.execute(f"DELETE FROM {tbl}")
+            except sqlite3.OperationalError:
+                # table might not exist yet; ignore
+                pass
+        conn.commit()
+        # Remove Parquet snapshots
+        try:
+            for p in PARQUET_DIR.glob("rm_*.parquet"):
+                p.unlink(missing_ok=True)
+        except Exception:
+            pass
+    st.success("Cleanup complete — only the incoming load will be kept.")
 
 # -------------------------------------------
 # Utilities
@@ -118,7 +161,7 @@ def excel_serial_to_datetime(series: pd.Series) -> pd.Series:
     return pd.to_datetime(dt.dt.date, errors="coerce")
 
 def detect_file_kind(file_name: str, df: pd.DataFrame) -> str:
-    """Simple heuristic: RM Extract contains these columns; else treat as PO."""
+    """Heuristic: RM Extract contains these columns; else treat as PO."""
     cols = set(df.columns)
     if {"Blocked Stock Qty", "Material ID", "Plant", "Plant ID"}.issubset(cols):
         return "RM"
@@ -128,6 +171,13 @@ def detect_file_kind(file_name: str, df: pd.DataFrame) -> str:
     return "PO"
 
 def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) -> pd.DataFrame:
+    """
+    Normalize RM data:
+      - Parse Month/Year → month_date (first day of month)
+      - Keep only needed columns
+      - Numeric conversion; trim strings
+      - Drop invalids and de-dupe inside batch
+    """
     df = df.copy()
     df.columns = [c.strip() for c in df.columns]
 
@@ -139,14 +189,11 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
             f"First columns seen: {sample}"
         )
 
-    # keep only the columns we actually need
+    # keep only needed columns
     df = df[[c for c in REPORT_COLUMNS if c in df.columns]].copy()
 
-    # snapshot date (prefer Report_Date else Month/Year)
-    snap = excel_serial_to_datetime(df.get("Report_Date"))
-    if snap.isna().all():
-        snap = excel_serial_to_datetime(df.get("Month/Year"))
-    df["snapshot_date"] = snap
+    # authoritative monthly axis from Month/Year → first day of month
+    df["month_date"] = excel_serial_to_datetime(df["Month/Year"]).dt.to_period("M").dt.to_timestamp()
 
     # numeric conversion
     df["Blocked Stock Qty"] = pd.to_numeric(df["Blocked Stock Qty"], errors="coerce").fillna(0.0)
@@ -161,13 +208,13 @@ def normalize_rm_dataframe(df: pd.DataFrame, src_name: str, version_tag: str) ->
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
 
-    # drop rows with no snapshot_date or no material id (often header bleed)
+    # drop rows with no month_date or no material id (header bleed)
     if "Material ID" in df.columns:
-        df = df[~(df["snapshot_date"].isna() | df["Material ID"].astype(str).str.strip().eq(""))]
+        df = df[~(df["month_date"].isna() | df["Material ID"].astype(str).str.strip().eq(""))]
 
-    # drop exact duplicates within the batch
+    # de-dupe within batch
     df = df.drop_duplicates(
-        subset=["version_tag", "snapshot_date", "Plant ID", "Material ID"],
+        subset=["month_date", "Plant ID", "Material ID"],
         keep="last"
     )
 
@@ -220,88 +267,136 @@ def to_sql_with_progress(df: pd.DataFrame, table: str, conn: sqlite3.Connection,
     pb.empty()
     return written
 
-def dedup_delete_existing_version(conn: sqlite3.Connection, version_tag: str) -> int:
-    """De-dup strategy: delete all existing RM rows for this version, then insert the fresh batch."""
-    cur = conn.execute(f'SELECT COUNT(*) FROM {TABLE_RM} WHERE version_tag = ?', (version_tag,))
-    cnt = cur.fetchone()[0] or 0
-    if cnt > 0:
-        st.info(f"🧹 De-dup: removing existing {cnt:,} row(s) for version `{version_tag}` …")
-        conn.execute(f'DELETE FROM {TABLE_RM} WHERE version_tag = ?', (version_tag,))
-        conn.commit()
-    return cnt
+def write_parquet_snapshot(df_norm: pd.DataFrame, label: str = "latest") -> str:
+    """
+    Write a Parquet snapshot (for DuckDB fast reads).
+    Only essential columns are persisted. Overwrites previous snapshots to keep only the latest.
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except Exception:
+        return ""
+    keep = [
+        "Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc",
+        "Blocked Stock Qty", "month_date"
+    ]
+    dfp = df_norm[keep].copy()
+    path = PARQUET_DIR / f"rm_latest.parquet"
+    table = pa.Table.from_pandas(dfp)
+    pq.write_table(table, path)
+    return str(path)
 
-def ingest_filelike(file_like: io.BytesIO, version_tag: str) -> List[str]:
-    """Ingest a single file-like object (BytesIO) and return messages."""
-    msgs = []
+# -------------------------------------------
+# Ingestion (LATEST ONLY)
+# -------------------------------------------
+def ingest_batch(files: List[io.BytesIO], version_tag_for_uploads: str, is_folder_scan: bool = False) -> List[str]:
+    """
+    Ingest a batch of files:
+      - Purge ALL existing DB rows and Parquet snapshots
+      - Ingest new files (RM normalized monthly + PO raw)
+      - Build a single Parquet snapshot named rm_latest.parquet (if optimized mode on)
+    """
+    msgs_all = []
     conn = get_conn()
     ensure_tables(conn)
 
-    fname = getattr(file_like, "name", "uploaded.xlsx")
-    try:
-        st.write(f"📄 **Processing:** {fname}")
-        df_all = read_xlsx_all_sheets(file_like)
-        kind = detect_file_kind(fname, df_all)
+    # 1) Purge everything first (keep ONLY latest)
+    purge_all_previous_records(conn)
 
-        if kind == "RM":
-            df_norm = normalize_rm_dataframe(df_all, fname, version_tag)
+    # 2) Process files
+    overall = st.progress(0, text="Starting ingestion …")
+    total = len(files) if files else 0
+    loaded_any_rm = False
+    latest_rm_rows = 0
+    latest_rm_df = None
 
-            # ---- De-dup per version_tag
-            dedup_delete_existing_version(conn, version_tag)
+    for i, f in enumerate(files, start=1):
+        fname = getattr(f, "name", "uploaded.xlsx")
+        try:
+            st.write(f"📄 **Processing:** {fname}")
+            df_all = read_xlsx_all_sheets(f)
+            kind = detect_file_kind(fname, df_all)
 
-            rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
-            conn.execute(
-                f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
-                f"VALUES (?, ?, ?, ?, ?)",
-                (TABLE_RM, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
-            )
-            conn.commit()
-            msgs.append(f"✅ {fname}: loaded {rows:,} rows into '{TABLE_RM}' (version '{version_tag}').")
-        else:
-            df_po = df_all.copy()
-            df_po["source_file"] = fname
-            df_po["version_tag"] = version_tag
-            df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
-            rows = to_sql_with_progress(df_po, TABLE_PO, conn, label=fname)
-            conn.execute(
-                f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
-                f"VALUES (?, ?, ?, ?, ?)",
-                (TABLE_PO, fname, version_tag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
-            )
-            conn.commit()
-            msgs.append(f"✅ {fname}: loaded {rows:,} rows into '{TABLE_PO}' (version '{version_tag}').")
+            if kind == "RM":
+                # Version tag for latest-only scenario is purely informational in the log;
+                # we keep only the latest rows anyway.
+                vtag = (datetime.utcfromtimestamp(os.path.getmtime(fname)).strftime("%Y-%m-%d")
+                        if is_folder_scan else version_tag_for_uploads)
 
-    except Exception as e:
-        msgs.append(f"❌ {fname}: ingestion failed — {e!s}")
+                df_norm = normalize_rm_dataframe(df_all, fname, vtag)
+                rows = to_sql_with_progress(df_norm, TABLE_RM, conn, label=fname)
 
-    # Ensure indexes (safe to repeat)
+                latest_rm_rows += rows
+                loaded_any_rm = True
+                latest_rm_df = df_norm if latest_rm_df is None else pd.concat([latest_rm_df, df_norm], ignore_index=True)
+
+                # Log entry
+                conn.execute(
+                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
+                    f"VALUES (?, ?, ?, ?, ?)",
+                    (TABLE_RM, fname, vtag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
+                )
+                conn.commit()
+                msgs_all.append(f"✅ {fname}: loaded {rows:,} RM row(s).")
+
+            else:
+                # PO history stored raw (optional for your reporting)
+                vtag = (datetime.utcfromtimestamp(os.path.getmtime(fname)).strftime("%Y-%m-%d")
+                        if is_folder_scan else version_tag_for_uploads)
+
+                df_po = df_all.copy()
+                df_po["source_file"] = fname
+                df_po["version_tag"] = vtag
+                df_po["uploaded_at_utc"] = datetime.utcnow().isoformat(timespec="seconds")
+                rows = to_sql_with_progress(df_po, TABLE_PO, conn, label=fname)
+                conn.execute(
+                    f"INSERT INTO {TABLE_LOG}(table_name, source_file, version_tag, uploaded_at_utc, rows_loaded) "
+                    f"VALUES (?, ?, ?, ?, ?)",
+                    (TABLE_PO, fname, vtag, datetime.utcnow().isoformat(timespec="seconds"), int(rows))
+                )
+                conn.commit()
+                msgs_all.append(f"✅ {fname}: loaded {rows:,} PO row(s).")
+
+        except Exception as e:
+            msgs_all.append(f"❌ {fname}: ingestion failed — {e!s}")
+
+        if total:
+            overall.progress(int(i / total * 100), text=f"Ingested {i}/{total} files")
+
+    overall.empty()
+
+    # 3) Indexes for fast reads
     try:
         ensure_indexes(conn)
     except Exception:
         pass
 
-    return msgs
+    # 4) Latest-only Parquet snapshot
+    if loaded_any_rm and opt_mode and HAVE_DUCKDB:
+        path = write_parquet_snapshot(latest_rm_df, label="latest")
+        if path:
+            msgs_all.append(f"💾 Parquet snapshot created: {Path(path).name}")
+
+    # Summary
+    if loaded_any_rm:
+        msgs_all.append(f"✅ Finished. Kept only the latest RM dataset with {latest_rm_rows:,} row(s).")
+    else:
+        msgs_all.append("⚠️ No RM data detected in this batch — database is empty (latest-only policy).")
+
+    return msgs_all
 
 def load_uploaded_files(files: List[io.BytesIO], version_tag: str) -> List[str]:
-    """Ingest files from st.file_uploader (with overall progress)."""
-    msgs_all = []
-    overall = st.progress(0, text="Starting ingestion …")
-    total = len(files)
-
-    for i, f in enumerate(files, start=1):
-        msgs_all.extend(ingest_filelike(f, version_tag))
-        overall.progress(int(i / total * 100), text=f"Ingested {i}/{total} files")
-
-    overall.empty()
-    return msgs_all
+    """Wrapper for uploader ingestion (latest only)."""
+    return ingest_batch(files, version_tag_for_uploads=version_tag, is_folder_scan=False)
 
 def scan_script_folder_and_ingest() -> List[str]:
     """
-    Scan THIS folder (where streamlit_app.py lives) for .xlsx files and ingest.
-    Version tag = file modified date (UTC, YYYY-MM-DD).
+    Scan THIS folder (where streamlit_app.py lives) for .xlsx files and ingest (latest only).
     """
     xlsx_paths = sorted(glob.glob(str(SCRIPT_DIR / "*.xlsx")))
 
-    # Show EXACT paths we found to avoid any ambiguity
+    # Show EXACT paths we found
     with st.expander(f"📂 Files detected in script folder ({SCRIPT_DIR}):", expanded=True):
         if xlsx_paths:
             for p in xlsx_paths:
@@ -313,65 +408,60 @@ def scan_script_folder_and_ingest() -> List[str]:
     if not xlsx_paths:
         return [f"⚠️ No .xlsx files found in script folder: `{SCRIPT_DIR}`"]
 
-    msgs_all = []
-    overall = st.progress(0, text=f"Scanning {len(xlsx_paths)} file(s) …")
-    for i, path in enumerate(xlsx_paths, start=1):
-        fname = os.path.basename(path)
-        try:
-            # Build a BytesIO so we reuse the same ingestion path as uploads
-            with open(path, "rb") as fh:
-                b = io.BytesIO(fh.read())
-                b.name = fname
+    # Build file-like objects and ingest as one batch
+    files = []
+    for path in xlsx_paths:
+        with open(path, "rb") as fh:
+            b = io.BytesIO(fh.read())
+            b.name = os.path.basename(path)
+            files.append(b)
 
-            # Version tag derived from file modified date (UTC)
-            vtag = datetime.utcfromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d")
-
-            msgs_all.extend(ingest_filelike(b, version_tag=vtag))
-        except Exception as e:
-            msgs_all.append(f"❌ {fname}: ingestion failed — {e!s}")
-
-        overall.progress(int(i / len(xlsx_paths) * 100), text=f"Processed {i}/{len(xlsx_paths)} file(s)")
-
-    overall.empty()
-    return msgs_all
+    return ingest_batch(files, version_tag_for_uploads=datetime.utcnow().strftime("%Y-%m-%d"), is_folder_scan=True)
 
 # -------------------------------------------
 # Data access for reporting
 # -------------------------------------------
 @st.cache_data(show_spinner=False)
-def get_versions() -> List[str]:
-    try:
-        conn = get_conn()
-        df = pd.read_sql(
-            f"SELECT DISTINCT version_tag FROM {TABLE_LOG} ORDER BY uploaded_at_utc DESC",
-            conn
-        )
-        return df["version_tag"].tolist()
-    except Exception:
-        return []
-
-@st.cache_data(show_spinner=False)
-def load_rm_for_report(versions: Optional[List[str]] = None) -> pd.DataFrame:
+def load_rm_for_report_sqlite() -> pd.DataFrame:
     conn = get_conn()
-    base_sql = f"""
+    sql = f"""
         SELECT
             "Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc",
-            "Blocked Stock Qty", snapshot_date, version_tag
+            "Blocked Stock Qty", month_date
         FROM {TABLE_RM}
-        WHERE snapshot_date IS NOT NULL
+        WHERE month_date IS NOT NULL
     """
-    if versions:
-        placeholders = ",".join(["?"] * len(versions))
-        sql = base_sql + f" AND version_tag IN ({placeholders})"
-        df = pd.read_sql(sql, conn, params=versions, parse_dates=["snapshot_date"])
-    else:
-        df = pd.read_sql(base_sql, conn, parse_dates=["snapshot_date"])
-
-    # Clean strings
+    df = pd.read_sql(sql, conn, parse_dates=["month_date"])
     for c in ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"]:
         if c in df.columns:
             df[c] = df[c].astype(str).str.strip()
     return df
+
+@st.cache_data(show_spinner=False)
+def load_rm_for_report_duckdb() -> pd.DataFrame:
+    """Load latest-only snapshot via DuckDB Parquet; fallback to SQLite if missing."""
+    if not (opt_mode and HAVE_DUCKDB):
+        return load_rm_for_report_sqlite()
+
+    path = PARQUET_DIR / "rm_latest.parquet"
+    if not path.exists():
+        return load_rm_for_report_sqlite()
+
+    import duckdb
+    con = duckdb.connect()
+    df = con.execute(f"""
+        SELECT
+          "Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc",
+          "Blocked Stock Qty", CAST(month_date AS TIMESTAMP) AS month_date
+        FROM read_parquet('{str(path)}')
+    """).df()
+    df["month_date"] = pd.to_datetime(df["month_date"])
+    for c in ["Plant", "Plant ID", "Material ID", "Material Desc", "Material Group Desc"]:
+        df[c] = df[c].astype(str).str.strip()
+    return df
+
+def load_rm_for_report() -> pd.DataFrame:
+    return load_rm_for_report_duckdb() if (opt_mode and HAVE_DUCKDB) else load_rm_for_report_sqlite()
 
 # -------------------------------------------
 # Filtering & Charts
@@ -399,78 +489,88 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 
     return df.loc[mask].copy()
 
-def render_time_series(df: pd.DataFrame):
-    st.markdown("### 📈 Blocked Stock Qty — Evolution Over Time")
+def extend_to_current_month(ts: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """
+    Reindex monthly time series to run through the current month and forward-fill values (global series).
+    """
+    if ts.empty:
+        return ts
+    cur_month = pd.Timestamp.today().to_period("M").to_timestamp()
+    ts = ts.sort_values("month_date")
+    start = ts["month_date"].min().to_period("M").to_timestamp()
+    idx = pd.date_range(start, cur_month, freq="MS")
+    g = ts.set_index("month_date").reindex(idx).rename_axis("month_date").reset_index()
+    g[value_col] = g[value_col].ffill().fillna(0.0)
+    return g
+
+def render_time_series(df: pd.DataFrame, extend_series: bool):
+    st.markdown("### 📈 Blocked Stock Qty — Monthly Inventory Evolution")
 
     if df.empty:
         st.info("No data after filters.")
         return
 
     ts = (
-        df.groupby("snapshot_date", as_index=False)["Blocked Stock Qty"]
+        df.groupby("month_date", as_index=False)["Blocked Stock Qty"]
           .sum()
-          .sort_values("snapshot_date")
+          .sort_values("month_date")
     )
 
-    unique_dates = ts["snapshot_date"].dropna().unique()
+    if extend_series:
+        ts = extend_to_current_month(ts, value_col="Blocked Stock Qty")
+
+    unique_dates = ts["month_date"].dropna().unique()
     if len(unique_dates) <= 1:
-        # Guard: if there is only one (or zero) snapshot, don't use a range slider
-        if len(unique_dates) == 0:
-            st.info("No valid snapshot dates found after filters.")
-            return
-        st.caption(f"Single snapshot date: {pd.to_datetime(unique_dates[0]).date()}")
+        st.caption("Not enough distinct months to build a range slider.")
         import plotly.express as px
         fig = px.line(
             ts,
-            x="snapshot_date",
+            x="month_date",
             y="Blocked Stock Qty",
             markers=True,
-            title="Blocked Stock Qty Evolution (single snapshot)",
-            labels={"snapshot_date": "Snapshot Date", "Blocked Stock Qty": "Blocked Stock Qty"},
+            title="Blocked Stock Qty Evolution (single month)",
         )
-        fig.update_layout(hovermode="x unified", height=420)
         st.plotly_chart(fig, use_container_width=True)
-        with st.expander("Show aggregated data"):
+        with st.expander("Show monthly data"):
             st.dataframe(ts, use_container_width=True)
         return
 
-    # Date range slider (for >= 2 distinct dates)
-    min_d, max_d = ts["snapshot_date"].min(), ts["snapshot_date"].max()
-    # Ensure python datetime objects
+    min_d, max_d = ts["month_date"].min(), ts["month_date"].max()
     min_dt = pd.to_datetime(min_d).to_pydatetime()
     max_dt = pd.to_datetime(max_d).to_pydatetime()
 
     dr = st.slider(
-        "Snapshot date range",
+        "Select month range",
         min_value=min_dt,
         max_value=max_dt,
         value=(min_dt, max_dt),
-        format="YYYY-MM-DD"
+        format="YYYY-MM"
     )
-    ts = ts[(ts["snapshot_date"] >= pd.to_datetime(dr[0])) & (ts["snapshot_date"] <= pd.to_datetime(dr[1]))]
+    ts = ts[(ts["month_date"] >= pd.to_datetime(dr[0])) &
+            (ts["month_date"] <= pd.to_datetime(dr[1]))]
 
     import plotly.express as px
     fig = px.line(
         ts,
-        x="snapshot_date",
+        x="month_date",
         y="Blocked Stock Qty",
         markers=True,
-        title="Blocked Stock Qty Evolution",
-        labels={"snapshot_date": "Snapshot Date", "Blocked Stock Qty": "Blocked Stock Qty"},
+        title="Blocked Stock Qty – Monthly Evolution",
+        labels={"month_date": "Month", "Blocked Stock Qty": "Blocked Stock Qty"},
     )
     fig.update_layout(hovermode="x unified", height=420)
     st.plotly_chart(fig, use_container_width=True)
 
-    with st.expander("Show aggregated data"):
+    with st.expander("Show monthly data"):
         st.dataframe(ts, use_container_width=True)
         st.download_button(
             "Download aggregated CSV",
             ts.to_csv(index=False).encode("utf-8"),
-            file_name="blocked_stock_evolution.csv",
+            file_name="blocked_stock_monthly_evolution.csv",
             mime="text/csv",
         )
 
-def render_cut_by_dimensions(df: pd.DataFrame):
+def render_cut_by_dimensions(df: pd.DataFrame, extend_series: bool):
     st.markdown("#### 🔬 Cut by dimension (top contributors)")
     dim = st.selectbox(
         "Group by",
@@ -478,19 +578,36 @@ def render_cut_by_dimensions(df: pd.DataFrame):
         index=0
     )
     top_n = st.slider("Top N", 3, 25, 10)
-    grouped = df.groupby([dim, "snapshot_date"], as_index=False)["Blocked Stock Qty"].sum()
-    latest = grouped["snapshot_date"].max()
+
+    grouped = df.groupby([dim, "month_date"], as_index=False)["Blocked Stock Qty"].sum()
+
+    if extend_series:
+        # forward fill per dimension through current month
+        cur_month = pd.Timestamp.today().to_period("M").to_timestamp()
+        out_frames = []
+        for val, g in grouped.groupby(dim, dropna=False):
+            g = g.sort_values("month_date")
+            start = g["month_date"].min().to_period("M").to_timestamp()
+            idx = pd.date_range(start, cur_month, freq="MS")
+            gg = g.set_index("month_date").reindex(idx).rename_axis("month_date").reset_index()
+            gg[dim] = val
+            gg["Blocked Stock Qty"] = gg["Blocked Stock Qty"].ffill().fillna(0.0)
+            out_frames.append(gg)
+        grouped = pd.concat(out_frames, ignore_index=True)
+
+    latest = grouped["month_date"].max()
     top_dim = (
-        grouped[grouped["snapshot_date"] == latest]
+        grouped[grouped["month_date"] == latest]
         .nlargest(top_n, "Blocked Stock Qty")[dim]
         .tolist()
     )
-    view = grouped[grouped[dim].isin(top_dim)]
+    view = grouped[grouped[dim].isin(top_dim)].sort_values(["month_date", dim])
+
     import plotly.express as px
     fig = px.line(
-        view, x="snapshot_date", y="Blocked Stock Qty", color=dim,
-        title=f"Blocked Stock Qty by {dim} (Top {top_n} @ latest snapshot)",
-        labels={"snapshot_date": "Snapshot Date", "Blocked Stock Qty": "Blocked Stock Qty", dim: dim},
+        view, x="month_date", y="Blocked Stock Qty", color=dim,
+        title=f"Blocked Stock Qty by {dim} (Top {top_n} @ latest month)",
+        labels={"month_date": "Month", "Blocked Stock Qty": "Blocked Stock Qty", dim: dim},
     )
     fig.update_layout(hovermode="x unified", height=420, legend=dict(orientation="h", y=-0.2))
     st.plotly_chart(fig, use_container_width=True)
@@ -501,15 +618,16 @@ def render_cut_by_dimensions(df: pd.DataFrame):
 # -------------------------------------------
 # UI
 # -------------------------------------------
-st.title("📦 Blocked Stock Reporting (RM) + Ingestion")
-st.caption("Scan this folder or upload files, load into SQLite (with de‑dup + progress), and explore Blocked Stock Qty over time.")
+st.title("📦 Blocked Stock Reporting — Monthly (Latest Only)")
+st.caption("On each load, all previous data is purged; only the newest dataset is kept. "
+           "Use Optimized mode for faster analytics on larger files.")
 
 with st.sidebar:
-    st.markdown("### 📥 Ingest data")
+    st.markdown("### 📥 Ingest data (latest-only)")
     version_tag = st.text_input(
-        "Version tag for uploads (e.g., 2026-02)",
+        "Version tag for uploads (informational)",
         value=datetime.utcnow().strftime("%Y-%m-%d"),
-        help="Used for files uploaded via drag & drop. Folder scan uses each file's modified date."
+        help="Used in logs for this single latest load; data retention is latest-only."
     )
 
     uploads = st.file_uploader(
@@ -521,40 +639,40 @@ with st.sidebar:
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("Load uploaded files", type="primary", use_container_width=True, disabled=(not uploads)):
+        if st.button("Load uploaded files (overwrite previous)", type="primary", use_container_width=True, disabled=(not uploads)):
             msgs = load_uploaded_files(uploads, version_tag=version_tag)
             for m in msgs:
                 st.toast(m, icon="✅" if m.startswith("✅") else "⚠️" if m.startswith("⚠️") else "❌")
             # refresh caches
-            get_versions.clear()
-            load_rm_for_report.clear()
+            load_rm_for_report_sqlite.clear()
+            load_rm_for_report_duckdb.clear()
 
     with col2:
-        if st.button("Scan & load (script folder)", use_container_width=True):
+        if st.button("Scan & load (script folder, overwrite previous)", use_container_width=True):
             msgs = scan_script_folder_and_ingest()
             for m in msgs:
                 st.toast(m, icon="✅" if m.startswith("✅") else "⚠️")
-            get_versions.clear()
-            load_rm_for_report.clear()
+            load_rm_for_report_sqlite.clear()
+            load_rm_for_report_duckdb.clear()
 
     st.caption(f"Script folder: `{SCRIPT_DIR}`")
 
-# Pull versions
-versions = get_versions()
-if not versions:
-    st.info("No data yet. Upload the **RM Extract** (drag & drop) or place `.xlsx` files **next to this script** and click **Scan & load (script folder)**.")
-    st.stop()
+st.markdown("### ⚙️ Chart options")
+extend_series = st.checkbox(
+    "Extend to current month (forward‑fill last known value)",
+    value=True,
+    help="Reindexes the monthly series through the current month and forward‑fills."
+)
 
-pick_versions = st.multiselect("Select version(s) for the report", options=versions, default=versions[:1])
-
+# Load latest-only RM data
 try:
-    df_rm = load_rm_for_report(pick_versions)
+    df_rm = load_rm_for_report()
 except Exception as e:
     st.error(f"Failed to load RM data for reporting: {e}")
     st.stop()
 
 if df_rm.empty:
-    st.warning("No RM data found for the selected version(s).")
+    st.info("No data available. Load a file set via the sidebar; previous contents are purged each time.")
     st.stop()
 
 # Filters
@@ -563,29 +681,29 @@ df_filtered = apply_filters(df_rm)
 # KPIs
 c1, c2, c3 = st.columns(3)
 c1.metric("Rows (after filters)", f"{len(df_filtered):,}")
-c2.metric("Snapshots", df_filtered["snapshot_date"].nunique())
+c2.metric("Months", df_filtered["month_date"].nunique())
 c3.metric("Blocked Stock Total", f"{df_filtered['Blocked Stock Qty'].sum():,.2f}")
 
 # Charts
-render_time_series(df_filtered)
-render_cut_by_dimensions(df_filtered)
+render_time_series(df_filtered, extend_series=extend_series)
+render_cut_by_dimensions(df_filtered, extend_series=extend_series)
 
 with st.expander("Show filtered rows"):
-    st.dataframe(df_filtered, use_container_width=True, height=400)
+    st.dataframe(df_filtered.sort_values(["month_date"]), use_container_width=True, height=400)
     st.download_button(
         "Download filtered CSV",
         df_filtered.to_csv(index=False).encode("utf-8"),
-        file_name="blocked_stock_filtered.csv",
+        file_name="blocked_stock_filtered_latest.csv",
         mime="text/csv"
     )
 
 st.markdown("---")
 st.markdown(
-    "ℹ️ **Notes**\n"
-    "- **De-duplication:** reloading the same version replaces prior rows for that `version_tag`.\n"
-    "- Folder scan shows **exactly which `.xlsx` files** are detected in the script folder.\n"
-    "- For folder scan, the **version tag** is each file's **modified date (UTC)**; uploads use the textbox value.\n"
-    "- The report uses **RM Extract** columns: Plant, Plant ID, Material ID, Material Desc, Material Group Desc, Blocked Stock Qty, and Month/Year or Report_Date."
+    "ℹ️ **Latest-only policy**\n"
+    "- Each ingestion **purges** all previous rows and Parquet snapshots; only the newest dataset remains.\n"
+    "- Time axis is derived from **`Month/Year`** and normalized to the **first day of each month**.\n"
+    "- Optimized mode writes/reads a single `rm_latest.parquet` snapshot for speed; otherwise the app reads from SQLite."
 )
+
 
 
